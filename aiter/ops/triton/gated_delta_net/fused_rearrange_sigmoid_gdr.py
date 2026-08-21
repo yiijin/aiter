@@ -7,12 +7,174 @@
 
 from __future__ import annotations
 
+import functools
+import os
+
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_gdr_available() -> bool:
+    try:
+        from aiter.ops.flydsl.utils import is_flydsl_available
+
+        return is_flydsl_available()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _flydsl_gdr_enabled() -> bool:
+    """Opt-in gate for the FlyDSL gated-delta-rule MTP port.
+
+    Off by default, so Triton keeps serving every call. Not memoized, so the env
+    var can be toggled at runtime; only the availability probe is cached.
+    """
+    return os.environ.get("AITER_GDR_FLYDSL", "") == "1" and _flydsl_gdr_available()
+
+
+def _uniform_draft_window(cu_seqlens: torch.Tensor | None, total_tokens: int) -> int:
+    """Draft length if every sequence has the same one, else -1.
+
+    The FlyDSL kernel bakes the window into the kernel it builds, so it can only
+    take a packed batch that unflattens to ``[N, T, ...]``. A ragged batch is not
+    a slow path for it, it is a different kernel per row, so it stays on Triton.
+    """
+    if cu_seqlens is None:
+        return -1
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    if lens.numel() == 0:
+        return -1
+    first = int(lens[0].item())
+    if first <= 0 or int(lens.min().item()) != first or int(lens.max().item()) != first:
+        return -1
+    if first * lens.numel() != total_tokens:
+        return -1
+    return first
+
+
+def _try_flydsl_mtp(
+    *,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    qkv,
+    key_dim,
+    value_dim,
+    head_k_dim,
+    head_v_dim,
+    softplus_beta,
+    softplus_threshold,
+    scale,
+    initial_state,
+    inplace_final_state,
+    cu_seqlens,
+    ssm_state_indices,
+    num_accepted_tokens,
+    use_qk_l2norm_in_kernel,
+    is_kda,
+    core_attn_out,
+):
+    """Route a speculative-verify call to the FlyDSL chain kernel, or decline.
+
+    Returns ``(out, final_state)`` when it took the call and ``None`` when the
+    caller should fall through to Triton. Declining is the common case: this
+    covers the MTP verify shape and nothing else.
+    """
+    if is_kda or not inplace_final_state or initial_state is None:
+        return None
+    if num_accepted_tokens is None or ssm_state_indices is None:
+        return None
+    if ssm_state_indices.ndim != 2:
+        return None
+    if qkv.ndim != 2 or qkv.stride(1) != 1:
+        return None
+    # The gating constants are compiled into the kernel, so only the pair the
+    # port was measured against is taken.
+    if float(softplus_beta) != 1.0 or float(softplus_threshold) != 20.0:
+        return None
+    if scale is not None and abs(float(scale) - head_k_dim**-0.5) > 1e-12:
+        return None
+
+    total_tokens = qkv.shape[0]
+    window = _uniform_draft_window(cu_seqlens, total_tokens)
+    if window <= 0:
+        return None
+    n_seq = total_tokens // window
+
+    H = key_dim // head_k_dim
+    HV = value_dim // head_v_dim
+    sl = qkv.stride(0)
+    base = qkv.storage_offset()
+
+    # q / k / v are strided views into the packed projection rather than copies;
+    # the kernel takes their strides as build parameters.
+    q = qkv.as_strided(
+        (n_seq, window, H, head_k_dim),
+        (window * sl, sl, head_k_dim, 1),
+        base,
+    )
+    k = qkv.as_strided(
+        (n_seq, window, H, head_k_dim),
+        (window * sl, sl, head_k_dim, 1),
+        base + key_dim,
+    )
+    v = qkv.as_strided(
+        (n_seq, window, HV, head_v_dim),
+        (window * sl, sl, head_v_dim, 1),
+        base + 2 * key_dim,
+    )
+
+    if a.ndim != 2 or b.ndim != 2 or a.stride(1) != 1 or b.stride(1) != 1:
+        return None
+    a_v = a.as_strided(
+        (n_seq, window, HV), (window * a.stride(0), a.stride(0), 1), a.storage_offset()
+    )
+    b_v = b.as_strided(
+        (n_seq, window, HV), (window * b.stride(0), b.stride(0), 1), b.storage_offset()
+    )
+
+    from aiter.ops.flydsl.linear_attention_kernels import (
+        _flydsl_gdr_mtp_supported,
+        flydsl_gdr_mtp,
+    )
+
+    idx = ssm_state_indices.to(torch.int32)
+    nacc = num_accepted_tokens.to(torch.int32)
+    if not _flydsl_gdr_mtp_supported(q, k, v, initial_state, idx, nacc):
+        return None
+    if a_v.dtype != qkv.dtype or b_v.dtype != qkv.dtype:
+        return None
+    if dt_bias.dtype != qkv.dtype:
+        return None
+
+    out = (
+        core_attn_out[: total_tokens * HV * head_v_dim].view(
+            n_seq, window, HV, head_v_dim
+        )
+        if core_attn_out is not None
+        else qkv.new_empty(n_seq, window, HV, head_v_dim)
+    )
+    flydsl_gdr_mtp(
+        query=q,
+        key=k,
+        value=v,
+        a=a_v,
+        b=b_v,
+        dt_bias=dt_bias,
+        A_log=A_log,
+        state=initial_state,
+        out=out,
+        ssm_state_indices=idx,
+        num_accepted_tokens=nacc,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+    )
+    return out.view(total_tokens, HV, head_v_dim), initial_state
 
 
 def fused_rearrange_sigmoid_gated_delta_rule(
@@ -44,6 +206,36 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     assert (
         qkv.shape == expected_shape
     ), f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
+
+    # FlyDSL port (opt-in). Only the speculative-verify shape is routed; every
+    # other call, and anything outside the port's scope, falls through to Triton
+    # below unchanged.
+    if _flydsl_gdr_enabled():
+        routed = _try_flydsl_mtp(
+            A_log=A_log,
+            a=a,
+            b=b,
+            dt_bias=dt_bias,
+            qkv=qkv,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            softplus_beta=beta,
+            softplus_threshold=threshold,
+            scale=scale,
+            initial_state=initial_state,
+            inplace_final_state=inplace_final_state,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            is_kda=is_kda,
+            core_attn_out=core_attn_out,
+        )
+        if routed is not None:
+            return routed
+
     if scale is None:
         scale = head_k_dim**-0.5
     else:
