@@ -136,12 +136,15 @@ elif not is_flydsl_available():
 else:
     try:
         from aiter.ops.flydsl.linear_attention_kernels import (
+            _MTP_BLOCKS_PER_CU,
             _SUPPORTED_DTYPES,
             _SUPPORTED_STATE_DTYPES,
+            _mtp_tiling,
             flydsl_gdr_mtp,
             flydsl_gdr_mtp_sglang,
             get_mtp_default_kwargs,
         )
+        from aiter.ops.flydsl.kernels.gdr_decode import MTP_MODE_CHAIN
         from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
             _flydsl_gdr_enabled,
             _uniform_draft_window,
@@ -1316,6 +1319,7 @@ def test_the_tiling_heuristic_only_emits_configs_the_builder_accepts():
                         head_k_dim,
                         head_v_dim,
                         torch.device(DEVICE),
+                        MTP_MODE_CHAIN,
                     )
                     nb = kw["NUM_BLOCKS_PER_V_DIM"]
                     nw = kw["NUM_WARPS"]
@@ -1336,6 +1340,77 @@ def test_the_tiling_heuristic_only_emits_configs_the_builder_accepts():
                     assert tile_v // warp_group_tile_v >= 1, where
 
 
+def test_every_tuned_row_is_a_tiling_the_builder_accepts():
+    """The table overrides the rule, so a bad row is a compile failure at serve.
+
+    The rule derives its tiling from the builder's constraints and so cannot
+    emit an illegal one; a table row is measured data pasted in by a sweep and
+    can be anything. This re-derives the constraints against every row rather
+    than compiling them, which would take hours for a few thousand rows.
+    """
+    import csv as _csv
+    from pathlib import Path as _Path
+
+    import aiter.ops.flydsl.linear_attention_kernels as lak
+
+    path = _Path(lak.__file__).resolve().parent / "gdr_decode_tuned.csv"
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows, f"{path} has no rows"
+
+    known = {lak.GDR_VARIANT_DECODE, "chain", "snapshot", "snapshot_tree"}
+    for row in rows:
+        variant = row["variant"]
+        head_k_dim, head_v_dim = int(row["head_k_dim"]), int(row["head_v_dim"])
+        nb = int(row["NUM_BLOCKS_PER_V_DIM"])
+        nw = int(row["NUM_WARPS"])
+        wtk = int(row["WARP_THREADS_K"])
+        where = (
+            f"{row['arch']} {variant} {row['dtype']}/{row['state_dtype']} "
+            f"b{row['b']} s{row['sq']} k{head_k_dim} v{head_v_dim} "
+            f"-> ({nb}, {nw}, {wtk})"
+        )
+        assert variant in known, where
+        assert 64 % wtk == 0, where
+        values_per_thread_k = 4 if "float32" in row["state_dtype"] else 8
+        warp_tile_k = wtk * values_per_thread_k
+        assert head_k_dim % warp_tile_k == 0, where
+        assert head_k_dim // warp_tile_k >= 1, where
+        assert head_v_dim % nb == 0, where
+        tile_v = head_v_dim // nb
+        warp_group_tile_v = nw * (64 // wtk)
+        assert tile_v % warp_group_tile_v == 0, where
+        assert tile_v // warp_group_tile_v >= 1, where
+
+
+def test_a_tuned_row_is_read_back_for_the_contract_it_was_measured_on():
+    """Rows are per contract, so the lookup must not hand one to another.
+
+    The three contracts pick different tilings at the same shape, which is the
+    whole reason the row carries a variant; if the key dropped it they would
+    silently share whichever row was loaded last.
+    """
+    import aiter.ops.flydsl.linear_attention_kernels as lak
+
+    shape = ("torch.bfloat16", "torch.float32", 7717, 4, 2, 32, 128, 128)
+    saved = lak.GDR_GLOBAL_CONFIG_MAP
+    try:
+        lak.GDR_GLOBAL_CONFIG_MAP = {
+            ("torch.bfloat16", "torch.float32", lak.GDR_GPU_ARCH, "chain")
+            + shape[2:]: {
+                "NUM_BLOCKS_PER_V_DIM": 4,
+                "NUM_WARPS": 2,
+                "WARP_THREADS_K": 8,
+            }
+        }
+        assert lak._tuned_config(*shape, "chain")["NUM_BLOCKS_PER_V_DIM"] == 4
+        assert lak._tuned_config(*shape, "snapshot") is None
+        assert lak._tuned_config(*shape, "snapshot_tree") is None
+        assert lak._tuned_config(*shape) is None
+    finally:
+        lak.GDR_GLOBAL_CONFIG_MAP = saved
+
+
 def test_the_tiling_heuristic_splits_only_while_the_grid_is_small():
     """The rule has to be the one that was measured, not merely a valid one.
 
@@ -1343,21 +1418,21 @@ def test_the_tiling_heuristic_splits_only_while_the_grid_is_small():
     what costs nothing at large batch, so both halves are pinned: a small batch
     must get more blocks than heads, and a batch that already covers the machine
     must be left at the decode tiling.
+
+    This asks the rule directly rather than through ``get_mtp_default_kwargs``,
+    which would answer out of the tuned table wherever the sweep has reached
+    and so stop testing the rule at exactly the shapes the sweep covers.
     """
     cus = torch.cuda.get_device_properties(0).multi_processor_count
 
     def pick(batch, num_v_heads=32):
-        return get_mtp_default_kwargs(
-            str(DTYPE),
-            str(STATE_DTYPE),
-            STATE_DTYPE,
+        return _mtp_tiling(
             batch,
-            4,
-            2,
             num_v_heads,
             HEAD_K_DIM,
             HEAD_V_DIM,
-            torch.device(DEVICE),
+            STATE_DTYPE,
+            _MTP_BLOCKS_PER_CU * cus,
         )["NUM_BLOCKS_PER_V_DIM"]
 
     assert pick(1) > 1, "batch 1 was left with one block per value dimension"

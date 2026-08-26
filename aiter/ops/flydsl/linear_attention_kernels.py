@@ -31,6 +31,17 @@ __all__ = [
 GDR_GLOBAL_CONFIG_MAP = None
 GDR_GPU_ARCH = get_rocm_arch()
 
+# Which kernel a tuned row was measured against. The three MTP contracts tile
+# differently at the same shape -- at batch 32 the chain wants (4, 2, 8), the
+# snapshot (8, 1, 16) and the tree (1, 4, 8), with no overlap -- so the row has
+# to name its contract or the three overwrite each other.
+GDR_VARIANT_DECODE = "decode"
+
+
+def _mtp_variant(mode, has_tree):
+    """The table's name for an MTP contract."""
+    return f"{mode}_tree" if has_tree else mode
+
 
 def _tuned_config(
     dtype_str,
@@ -41,8 +52,9 @@ def _tuned_config(
     num_v_heads,
     head_k_dim,
     head_v_dim,
+    variant=GDR_VARIANT_DECODE,
 ):
-    """The tuned row for this shape, or None.
+    """The tuned row for this shape and kernel variant, or None.
 
     Split out of ``get_default_kwargs`` so the MTP path can consult the same
     table while starting from a different default. The table wins wherever it
@@ -66,8 +78,9 @@ def _tuned_config(
                     int(obj["head_v_dim"]),
                 )
                 d_str, sd_str = obj["dtype"], obj["state_dtype"]
+                var = obj.get("variant") or GDR_VARIANT_DECODE
                 if float(obj["duration"]) < 10000.0:
-                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
+                    _dict[(d_str, sd_str, arch, var, b, sq, nkh, nvh, khd, vhd)] = {
                         "NUM_BLOCKS_PER_V_DIM": int(obj["NUM_BLOCKS_PER_V_DIM"]),
                         "NUM_WARPS": int(obj["NUM_WARPS"]),
                         "WARP_THREADS_K": int(obj["WARP_THREADS_K"]),
@@ -78,6 +91,7 @@ def _tuned_config(
             dtype_str,
             state_dtype_str,
             GDR_GPU_ARCH,
+            variant,
             batch_size,
             seq_length,
             num_k_heads,
@@ -197,6 +211,7 @@ def _mtp_kwargs(
     head_k_dim,
     head_v_dim,
     device,
+    variant,
 ):
     """Pick a tiling for the MTP kernel, then let the tuned table override it.
 
@@ -212,12 +227,15 @@ def _mtp_kwargs(
     launch path cannot mask it: this recovers 1.73x / 1.50x / 1.23x / 1.18x at
     batch 1 / 2 / 4 / 8 with a 4-token window and 1.66x / 1.47x / 1.17x / 1.04x
     with a 2-token window, is flat from batch 16 up where the default already
-    fills the grid, and lands a mean 1.03x off the per-shape optimum against the
+    fills the grid, and lands a mean 1.02x off the per-shape optimum against the
     default's 1.22x.
 
-    The tuned table still wins wherever it has a row. It has none for a
-    speculative window today -- every row is ``sq=1`` -- so in practice this
-    picks, but a later sweep can override it per shape without touching this.
+    What it does not close is the last 1.02x, which is concentrated above batch
+    32 and reaches 1.08x at the worst shape. That is left to the table rather
+    than to a sharper rule because the three contracts want different splits at
+    the same shape -- at batch 32, (4, 2, 8), (8, 1, 16) and (1, 4, 8), with no
+    overlap -- so rows are keyed by contract and this stays the fallback for the
+    shapes a sweep has not reached.
     """
     d = _mtp_tiling(
         batch_size,
@@ -240,6 +258,7 @@ def _mtp_kwargs(
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        variant,
     )
     if config:
         d.update(config)
@@ -577,6 +596,7 @@ def _mtp_launch(
         head_k_dim,
         head_v_dim,
         query.device,
+        _mtp_variant(mode, has_tree),
     )
 
     # Unused operands are handed an existing tensor rather than a null pointer:
