@@ -762,6 +762,37 @@ def create_vk_gdr_mtp_kernel(
                             vi * WARP_TILE_K_ITERS + ki
                         ].extf(acc_vec_t)
 
+            def _taps(sq):
+                """The gate and value scalars one token reads, issued together."""
+                return (
+                    a_tensor[b_i, sq, hv_i],
+                    b_tensor[b_i, sq, hv_i],
+                    [
+                        v_tensor[b_i, sq, hv_i, global_v_start + vi * WARP_GROUP_TILE_V]
+                        for vi in range_constexpr(WARP_TILE_V_ITERS)
+                    ],
+                )
+
+            # Read those a token ahead of where they are used.
+            #
+            # A token ends by storing its state, and nothing tells the compiler
+            # that the store cannot land on the gate or value inputs, so a read
+            # placed where it is used may not be hoisted over the store in front
+            # of it. Every token then opens with a round trip that has only its
+            # own gating arithmetic to hide it. Issuing the next token's reads
+            # before this one's stores puts a whole token of work in front of
+            # that round trip instead, and taking a token's value reads as a
+            # group lets one wait cover the whole v loop rather than one wait per
+            # iteration.
+            #
+            # Depth one, not the whole window: the taps stay unwidened, one
+            # register each, so depth d costs `d * (2 + WARP_TILE_V_ITERS)`
+            # registers, and hoisting all four tokens measured slower
+            # everywhere. A token of work is already enough to cover the round
+            # trip, so further depth buys nothing and the registers it sits in
+            # cost occupancy.
+            taps = _taps(0)
+
             for sq_i in range_constexpr(seq_length):
                 # EAGLE tree: restart from the parent token's snapshot. Token 0
                 # has no parent and keeps the rollback state loaded above. The
@@ -791,8 +822,12 @@ def create_vk_gdr_mtp_kernel(
                                     acc_vec_t
                                 )
 
-                r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
-                r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
+                tap_a, tap_b, r_v_raw = taps
+                if const_expr(sq_i + 1 < seq_length):
+                    taps = _taps(sq_i + 1)
+
+                r_a = tap_a.extf(T.f32)
+                r_b = tap_b.extf(T.f32)
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
@@ -897,7 +932,7 @@ def create_vk_gdr_mtp_kernel(
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
-                    r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
+                    r_v = r_v_raw[vi].extf(T.f32)
 
                     sum_hk = fx.Vector.from_elements(
                         [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
