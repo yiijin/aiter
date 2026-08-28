@@ -622,9 +622,30 @@ def create_vk_gdr_mtp_kernel(
         # rather than a shape, so a 1-D [B] and a 2-D [B, T] map the same way.
         si_tensor = GTensor(state_indices, dtype=T.i32, shape=(-1,))
 
+        # Read every token's checkpoint slot here rather than at the token that
+        # writes it.
+        #
+        # The chain's slots are `seq_length` independent int32s, but read one
+        # per token they turned into one dependent round trip per token: the
+        # load is issued inside the token's own body and the compare that gates
+        # its checkpoint waits at vmcnt(0), which drains every other load in
+        # flight along with it. That was 20% of stall cycles at batch 1, spread
+        # evenly across the loop, and it is the one part of the token's inputs
+        # the lookahead below does not already cover.
+        #
+        # Reading them together costs `seq_length` registers and lets one wait
+        # cover all of them, inside the prologue that is already waiting on the
+        # rollback lookup. The snapshot contract has a single slot for the whole
+        # sequence, so there is nothing to spread there.
+        if const_expr(CHAIN):
+            token_slots = [
+                fx.Int32(si_tensor[b_i * si_strides[0] + t * si_strides[1]])
+                for t in range_constexpr(seq_length)
+            ]
+
         def _slot_at(token):
             if const_expr(CHAIN):
-                return fx.Int32(si_tensor[b_i * si_strides[0] + token * si_strides[1]])
+                return token_slots[token]
             return fx.Int32(si_tensor[b_i * si_strides[0]])
 
         # What counts as a dead slot, which the two contracts spell differently.
