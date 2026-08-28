@@ -543,6 +543,18 @@ def create_vk_gdr_mtp_kernel(
     assert TILE_V >= 1 and head_v_dim % NUM_BLOCKS_PER_V_DIM == 0
     assert WARP_TILE_V_ITERS >= 1 and TILE_V % WARP_GROUP_TILE_V == 0
 
+    # Registers the resident state alone occupies. It is the tiling's whole
+    # register story: every other live value in the token body is a scalar or a
+    # single K vector.
+    STATE_REGS = WARP_TILE_V_ITERS * WARP_TILE_K_ITERS * VALUES_PER_THREAD_K
+
+    # What one wave may allocate and still leave room for four on a SIMD. gfx9
+    # gives a wave64 SIMD a 512-entry vector file, so four resident waves is
+    # 128 registers each; WARP_SIZE is asserted 64 above, so the wave width
+    # this assumes is not in question. A tiling whose state alone reaches this
+    # has nothing left to spend on scheduling freedom.
+    VGPR_PER_WAVE_AT_4 = 512 // 4
+
     WARP_THREADS_K_SHFL_OFFSETS = []
     offsets_ = WARP_THREADS_K // 2
     while offsets_ >= 1:
@@ -596,6 +608,14 @@ def create_vk_gdr_mtp_kernel(
     ):
         scale = fx.Float32(SCALE_VALUE)
         softplus_beta_ = fx.Float32(softplus_beta)
+        # Reciprocal of a builder constant, taken in Python rather than left as
+        # a divide in the token body. At the default beta of 1.0 this changes
+        # nothing, and measurably so: the backend folds `x / 1.0` away
+        # entirely, which is why making this change by itself moved no
+        # instruction. It is for every other beta. Only an exact power of two
+        # becomes a multiply; any other divisor is the full div_scale / rcp /
+        # div_fmas / div_fixup expansion, eleven instructions once per token.
+        inv_softplus_beta_ = fx.Float32(1.0 / softplus_beta)
         softplus_threshold_ = fx.Float32(softplus_threshold)
 
         dtype_ = get_dtype_in_kernel(dtype)
@@ -762,6 +782,29 @@ def create_vk_gdr_mtp_kernel(
 
         def fast_log1p(x):
             return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
+
+        def fast_rsqrt(x):
+            """Hardware reciprocal square root.
+
+            `fx.math.rsqrt` lowers to a sqrt followed by a correctly-rounded
+            divide, and with fast math off nothing folds either afterwards: the
+            backend emits the denormal pre-scale and ULP fixup around the sqrt
+            and a div_scale / rcp / fma / div_fmas / div_fixup expansion around
+            the divide. That pair is 33 instructions on gfx950, of which the
+            divide alone is 11, where `v_rsq_f32` is one for the same value to
+            about one ULP -- well inside a body that already takes exp as exp2
+            and log1p under fast math, and far inside a bf16 output.
+            """
+            return rocdl.rsq(T.f32, _to_raw(fx.Float32(x)))
+
+        def fast_rcp(x):
+            """Hardware reciprocal, for the same reason as `fast_rsqrt`.
+
+            The sigmoid gate's denominator is already an exp2, so the eleven
+            instructions of a correctly rounded divide on top of it buy nothing
+            the input can support.
+            """
+            return rocdl.rcp(T.f32, _to_raw(fx.Float32(x)))
 
         # Issue the inputs that do not depend on the rollback slot ahead of the
         # dead-slot test rather than inside it.
@@ -930,13 +973,13 @@ def create_vk_gdr_mtp_kernel(
                 # softplus with the large-x identity: for beta_x > threshold,
                 # softplus(x) == x. select computes both arms (the overflow arm
                 # is discarded) -> bit-identical to the old branch.
-                softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
+                softplus_big = inv_softplus_beta_ * fast_log1p(fast_exp(beta_x))
                 softplus_x = (
                     fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
                 ).select(softplus_big, x)
 
                 r_g_value = -fast_exp(r_A_log) * softplus_x
-                r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
+                r_beta = fast_rcp(f32_1 + fast_exp(-r_b))
                 r_g = fast_exp(r_g_value)
 
                 r_g_vec = fx.Vector.filled(
@@ -949,6 +992,33 @@ def create_vk_gdr_mtp_kernel(
                 scale_vec = fx.Vector.filled(
                     VALUES_PER_THREAD_K, fx.Float32(scale), fx.Float32
                 )
+
+                if const_expr(STATE_REGS >= VGPR_PER_WAVE_AT_4):
+                    # Where the state already fills the register file, keep the
+                    # gate arithmetic and the L2-norm reduction from
+                    # interleaving: eliminating the divide expansions turned
+                    # both into short clusters the scheduler will happily
+                    # overlap, and the four registers that costs are four this
+                    # tiling does not have. For the one tiling that reaches this
+                    # it is the difference between 3 and 4 resident waves, and
+                    # without it the tuner cannot pick that tiling at all: two
+                    # tuned tree rows now do.
+                    #
+                    # The mask names every memory class, exempting it, so the
+                    # load pipeline that actually limits this kernel keeps its
+                    # freedom; what is held is the arithmetic, meaning VALU,
+                    # SALU and the transcendentals the gate is now built from.
+                    # A full barrier in the same place is worse than none, at
+                    # 140 registers: it makes values live across itself rather
+                    # than stopping them being computed early. Applied
+                    # unconditionally this one costs 0.8% over the sweep, which
+                    # is why the tiling asks for it rather than it always being
+                    # on. Over every tiling the predicate admits it helps or is
+                    # neutral on all but (2,1,4), which is 12% off the pace for
+                    # unrelated reasons and is never tuned to.
+                    rocdl.sched_barrier(
+                        "all_vmem|vmem_read|vmem_write|all_ds|ds_read|ds_write"
+                    )
 
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
@@ -1002,8 +1072,8 @@ def create_vk_gdr_mtp_kernel(
                         width_i32,
                         mode="idx",
                     ).shuffleResult
-                    inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
-                    inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
+                    inv_norm_q = fast_rsqrt(local_sum_q + 1e-6)
+                    inv_norm_k = fast_rsqrt(local_sum_k + 1e-6)
                     inv_norm_q_vec = fx.Vector.filled(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_q), fx.Float32
                     )
