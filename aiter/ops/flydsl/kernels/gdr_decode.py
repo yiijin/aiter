@@ -758,6 +758,50 @@ def create_vk_gdr_mtp_kernel(
         def fast_log1p(x):
             return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
 
+        # Issue the inputs that do not depend on the rollback slot ahead of the
+        # dead-slot test rather than inside it.
+        #
+        # `read_slot` sits two dependent round trips deep -- `num_accepted[b_i]`
+        # names the token, that token's entry names the slot -- and the test
+        # below waits on both. Everything a token reads that is addressed by
+        # `b_i` and `hv_i` alone, meaning the decay scalars and token 0's gate
+        # and value taps, is ready to issue long before that. Written inside the
+        # guard it cannot be: their descriptors and loads only go out once the
+        # test resolves, so they queue behind a wait they have no dependence on.
+        # Hoisting them runs their latency underneath the lookup's.
+        #
+        # A dead sequence now issues these reads and discards them. They are in
+        # bounds either way -- `b_i` is a real batch row whatever its slot says,
+        # which is already why the slot loads above are unguarded -- and CG-pad
+        # rows are the rare case, so the wasted bytes cost less than the
+        # serialisation they remove.
+        #
+        # Chain contracts only. The tree emits the body once per snapshot arm,
+        # so hoisted values are live across both copies rather than one; that
+        # costs four VGPRs and measured 2% slower over the tree's shapes, 8% at
+        # batch 1, where the chain gains 1.3%. Read against the arm the change
+        # does not touch, in the same interleaved rounds.
+        HOIST_ENTRY = not TREE
+
+        def _taps(sq):
+            """The gate and value scalars one token reads, issued together."""
+            return (
+                a_tensor[b_i, sq, hv_i],
+                b_tensor[b_i, sq, hv_i],
+                [
+                    v_tensor[b_i, sq, hv_i, global_v_start + vi * WARP_GROUP_TILE_V]
+                    for vi in range_constexpr(WARP_TILE_V_ITERS)
+                ],
+            )
+
+        if const_expr(HOIST_ENTRY):
+            if const_expr("f32" in A_log_dtype):
+                entry_A_log = A_log_tensor[hv_i]
+            else:
+                entry_A_log = A_log_tensor[hv_i].extf(T.f32)
+            entry_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+            entry_taps = _taps(0)
+
         # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
         # closure so the runtime `if` sees an opaque call (no GTensor "state"
         # to thread through an scf.if yield) -- lowers to scf.if, no raw region.
@@ -772,11 +816,15 @@ def create_vk_gdr_mtp_kernel(
         # body twice buys back the per-token snapshot guard as well, since each
         # copy knows statically whether the slot is live.
         def _do_mtp(reload_parents=False, snapshot="no"):
-            if const_expr("f32" in A_log_dtype):
-                r_A_log = A_log_tensor[hv_i]
+            if const_expr(not HOIST_ENTRY):
+                if const_expr("f32" in A_log_dtype):
+                    r_A_log = A_log_tensor[hv_i]
+                else:
+                    r_A_log = A_log_tensor[hv_i].extf(T.f32)
+                r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
             else:
-                r_A_log = A_log_tensor[hv_i].extf(T.f32)
-            r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+                r_A_log = entry_A_log
+                r_dt_bias = entry_dt_bias
 
             read_state_tensor = _state_at(read_slot)
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
@@ -796,17 +844,6 @@ def create_vk_gdr_mtp_kernel(
                             vi * WARP_TILE_K_ITERS + ki
                         ].extf(acc_vec_t)
 
-            def _taps(sq):
-                """The gate and value scalars one token reads, issued together."""
-                return (
-                    a_tensor[b_i, sq, hv_i],
-                    b_tensor[b_i, sq, hv_i],
-                    [
-                        v_tensor[b_i, sq, hv_i, global_v_start + vi * WARP_GROUP_TILE_V]
-                        for vi in range_constexpr(WARP_TILE_V_ITERS)
-                    ],
-                )
-
             # Read those a token ahead of where they are used.
             #
             # A token ends by storing its state, and nothing tells the compiler
@@ -825,7 +862,10 @@ def create_vk_gdr_mtp_kernel(
             # everywhere. A token of work is already enough to cover the round
             # trip, so further depth buys nothing and the registers it sits in
             # cost occupancy.
-            taps = _taps(0)
+            #
+            # Token 0's pair is the one hoisted above the dead-slot test where
+            # that pays; the rest are issued here, a token ahead, as before.
+            taps = entry_taps if const_expr(HOIST_ENTRY) else _taps(0)
 
             for sq_i in range_constexpr(seq_length):
                 # EAGLE tree: restart from the parent token's snapshot. Token 0
