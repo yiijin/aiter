@@ -511,6 +511,11 @@ def create_vk_gdr_mtp_kernel(
     assert not TREE or len(inter_strides) == 5, "tree needs a snapshot buffer"
     SAVE_INTER = SNAPSHOT and len(inter_strides) == 5
 
+    # Whether a snapshot read back returns the accumulator that was written.
+    # Only then may the tree skip reloading a parent it still holds; at a
+    # narrower buffer dtype the reload is a rounding, not redundant work.
+    LOSSLESS_SNAPSHOT = TREE and "f32" in inter_dtype
+
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
 
@@ -869,13 +874,30 @@ def create_vk_gdr_mtp_kernel(
 
             for sq_i in range_constexpr(seq_length):
                 # EAGLE tree: restart from the parent token's snapshot. Token 0
-                # has no parent and keeps the rollback state loaded above. The
-                # reload happens even when the parent is the previous token,
-                # rather than reusing what is already in registers, because the
-                # snapshot may be stored at a narrower dtype than the
-                # accumulator -- re-reading it is a rounding the chain would not
-                # otherwise take, and upstream takes it.
-                if const_expr(reload_parents and sq_i != 0):
+                # has no parent and keeps the rollback state loaded above.
+                #
+                # Token 1 is the one case where the parent is known without
+                # reading it: token 0 is the only token before it, so its parent
+                # is token 0, which is also the token just finished -- the state
+                # is still in registers. Reloading it re-reads a full state that
+                # was written moments earlier, and parent reloads are what make
+                # this contract move 2.10 states per (batch, head) against the
+                # chain's 0.54.
+                #
+                # Skipping is only sound where the snapshot round trip returns
+                # the accumulator, hence LOSSLESS_SNAPSHOT: at a narrower buffer
+                # dtype the re-read is a rounding upstream also takes, and
+                # dropping it would change results.
+                #
+                # Only token 1. Later tokens can have any earlier parent, so the
+                # same saving there needs a runtime test, and that test has to
+                # carry the whole state out through an scf.if yield. Measured,
+                # that costs more at the small shapes than the reads it saves,
+                # and on an EAGLE tree it almost never fires -- a token whose
+                # parent is its immediate predecessor is the chain case the tree
+                # exists to generalise away from.
+                held = LOSSLESS_SNAPSHOT and sq_i == 1
+                if const_expr(reload_parents and sq_i != 0 and not held):
                     parent_step = fx.Int32(
                         parent_tensor[
                             b_i * parent_strides[0] + sq_i * parent_strides[1]
