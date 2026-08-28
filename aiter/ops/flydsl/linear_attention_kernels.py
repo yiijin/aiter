@@ -511,6 +511,13 @@ def _flydsl_gdr_mtp_sglang_supported(
             return False
         if intermediate_states_buffer.dtype not in _SUPPORTED_STATE_DTYPES:
             return False
+        # The snapshot is stored with the same lane count as the state, since
+        # that is the tiling the kernel is built around, so its element cannot
+        # be the wider of the two: a bf16 state splits K eight ways, and eight
+        # fp32 snapshot elements are a 32-byte store the buffer ops cannot
+        # express. Refused here rather than left to fail in the backend.
+        if intermediate_states_buffer.dtype.itemsize > state.dtype.itemsize:
+            return False
         if intermediate_states_buffer.shape[1] < query.shape[1]:
             return False
         if intermediate_state_indices.dtype != torch.int32:
@@ -529,6 +536,12 @@ def _flydsl_gdr_mtp_sglang_supported(
         if not _unit_strided(retrieve_parent_token):
             return False
     return _mtp_shapes_supported(query, key, value, state)
+
+
+def _snapshot_store_bytes(state_dtype, inter_dtype) -> int:
+    """Width of one thread's snapshot store, for the error that refuses it."""
+    values_per_thread_k = 4 if state_dtype == torch.float32 else 8
+    return values_per_thread_k * inter_dtype.itemsize
 
 
 def _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out):
@@ -764,6 +777,16 @@ def flydsl_gdr_mtp_sglang(
             raise ValueError(
                 "`intermediate_states_buffer` must have K contiguous; got stride "
                 f"{intermediate_states_buffer.stride()}."
+            )
+        if intermediate_states_buffer.dtype.itemsize > state.dtype.itemsize:
+            raise ValueError(
+                "`intermediate_states_buffer` cannot be wider than `state`: the "
+                "snapshot is written with the lane count the state's dtype sets, "
+                f"so a {state.dtype} state and a "
+                f"{intermediate_states_buffer.dtype} snapshot ask for a "
+                f"{_snapshot_store_bytes(state.dtype, intermediate_states_buffer.dtype)}"
+                "-byte store that the buffer ops cannot express. Store the "
+                "snapshot at `state.dtype` or narrower."
             )
         assert intermediate_state_indices.dtype == torch.int32
     if retrieve_parent_token is not None:

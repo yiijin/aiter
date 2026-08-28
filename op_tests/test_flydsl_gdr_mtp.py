@@ -139,12 +139,18 @@ else:
             _MTP_BLOCKS_PER_CU,
             _SUPPORTED_DTYPES,
             _SUPPORTED_STATE_DTYPES,
+            _flydsl_gdr_mtp_sglang_supported,
             _mtp_tiling,
             flydsl_gdr_mtp,
             flydsl_gdr_mtp_sglang,
             get_mtp_default_kwargs,
         )
-        from aiter.ops.flydsl.kernels.gdr_decode import MTP_MODE_CHAIN
+        from aiter.ops.flydsl.kernels.gdr_decode import (
+            MTP_MODE_CHAIN,
+            MTP_MODE_SNAPSHOT,
+            create_vk_gdr_mtp_kernel,
+        )
+        from aiter.ops.flydsl.kernels.tensor_shim import get_dtype_str
         from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
             _flydsl_gdr_enabled,
             _uniform_draft_window,
@@ -991,6 +997,67 @@ def test_sglang_tree_without_a_snapshot_slot_runs_the_chain():
         torch.zeros_like(inter),
     )
     _assert_bit_exact("tree without a snapshot slot", "the output", out, plain)
+
+
+def test_a_snapshot_wider_than_the_state_is_refused_at_every_layer():
+    """A snapshot dtype wider than the state's has no store to lower to.
+
+    ``VALUES_PER_THREAD_K`` is chosen so the *state* vector is 16 bytes -- 4
+    fp32 or 8 bf16 -- and the snapshot reuses that lane count with its own
+    element. A bf16 state and an fp32 snapshot therefore ask for eight fp32 in
+    one store, twice what a buffer op carries, and the combination used to
+    reach the backend and abort the process with `Cannot select`. An aborted
+    process cannot be caught, so each layer that can be entered from outside
+    has to refuse it: the dispatch screen by declining the path, and the API
+    and the builder by raising.
+    """
+    p = _make_problem(2, 4, seed=41, state_dtype=torch.bfloat16)
+    wide = torch.zeros(
+        p.batch,
+        p.seqlen,
+        p.num_v_heads,
+        p.head_v_dim,
+        p.head_k_dim,
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+    assert wide.dtype.itemsize > p.pool.dtype.itemsize, "the case under test"
+
+    # The screen the dispatch seam consults: decline, so the caller keeps its
+    # own kernel rather than being handed an error.
+    assert not _flydsl_gdr_mtp_sglang_supported(
+        p.q, p.k, p.v, p.pool, p.seq_indices, wide, p.seq_indices, None
+    )
+
+    # The API, which a caller may reach without going through the screen.
+    with pytest.raises(ValueError, match="cannot be wider than"):
+        _run_flydsl_sglang(p, save_inter=True, parents=_eagle_tree(2, 4), inter=wide)
+
+    # The builder, which is the layer that cannot express the store. Strides
+    # come off the real tensors so the call stays valid as the signature moves.
+    with pytest.raises(AssertionError, match="cannot be wider than the state"):
+        create_vk_gdr_mtp_kernel(
+            get_dtype_str(p.q.dtype),
+            get_dtype_str(p.A_log.dtype),
+            get_dtype_str(p.pool.dtype),
+            get_dtype_str(wide.dtype),
+            p.seqlen,
+            p.num_k_heads,
+            p.num_v_heads,
+            p.head_k_dim,
+            p.head_v_dim,
+            p.q.stride(),
+            p.k.stride(),
+            p.v.stride(),
+            p.pool.stride(),
+            p.a.stride(),
+            p.b.stride(),
+            tuple(p.seq_indices.stride()) + (1,),
+            tuple(wide.stride()),
+            (),
+            True,
+            MTP_MODE_SNAPSHOT,
+        )
 
 
 # -- the two address computations, against each other ---------------------

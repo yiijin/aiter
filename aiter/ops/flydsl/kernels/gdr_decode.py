@@ -548,6 +548,19 @@ def create_vk_gdr_mtp_kernel(
     STATE_BYTES = get_dtype_bytes(state_dtype)
     INTER_BYTES = get_dtype_bytes(inter_dtype) if SAVE_INTER else 0
 
+    # The snapshot borrows the state's lane count -- VALUES_PER_THREAD_K is
+    # picked so the *state* vector is 16 bytes, and the snapshot reuses it with
+    # its own element -- so a snapshot wider than the state overruns what a
+    # buffer op carries. Caught here as well as at the API, because this is the
+    # layer that cannot express the store: without it the combination reaches
+    # the backend as a 32-byte store and dies there as `Cannot select`.
+    assert not SAVE_INTER or VALUES_PER_THREAD_K * INTER_BYTES <= 16, (
+        f"a {state_dtype} state splits K {VALUES_PER_THREAD_K} ways, so a "
+        f"{inter_dtype} snapshot needs a "
+        f"{VALUES_PER_THREAD_K * INTER_BYTES}-byte store; the snapshot dtype "
+        f"cannot be wider than the state's"
+    )
+
     KERNEL_NAME = f"gdr_mtp_{mode}_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     if TREE:
         KERNEL_NAME += "_tree"
