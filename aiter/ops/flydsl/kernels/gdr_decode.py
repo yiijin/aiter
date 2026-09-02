@@ -472,48 +472,37 @@ def create_vk_gdr_mtp_kernel(
 ):
     """Gated delta rule over a speculative draft window.
 
-    The decode kernel above runs ``seq_length`` tokens straight through and
-    stores the state once at the end. That is not verify: verify has to be able
-    to *undo* tokens the target model rejects, which means both a rollback point
-    to start from and a per-token record to roll back to. The two upstreams
-    disagree on how to keep that record, so ``mode`` picks between them.
+    Verify has to be able to undo the tokens the target model rejects, so it
+    needs both a rollback point and a per-token record. The two upstreams keep
+    that record in different places, and ``mode`` picks between them.
 
     ``MTP_MODE_CHAIN`` is vLLM's. The draft is a linear chain, the rollback
-    point is the slot at ``state_indices[n, num_accepted - 1]``, and the record
-    is the state pool itself: every token checkpoints into its own slot
-    ``state_indices[n, t]``. There is no separate final store, because the last
-    token's checkpoint already is it.
+    point is ``state_indices[n, num_accepted - 1]``, and the record is the state
+    pool itself: every token checkpoints into ``state_indices[n, t]``. The last
+    token's checkpoint is the final store, so there is no separate one.
 
     ``MTP_MODE_SNAPSHOT`` is SGLang's. The rollback point is the sequence's one
-    slot ``state_indices[n]``, and the record lives outside the pool, in
-    ``intermediate_states_buffer``. With ``has_tree`` the draft is an EAGLE tree
-    rather than a chain, so each token restarts from its parent's snapshot
-    instead of from the previous token's state; ``disable_state_update``
-    suppresses the write-back to the pool, which is how a verify pass leaves the
-    committed state alone.
+    slot ``state_indices[n]`` and the record lives in
+    ``intermediate_states_buffer``. With ``has_tree`` the draft is an EAGLE tree,
+    so each token restarts from its parent's snapshot rather than from its
+    predecessor; ``disable_state_update`` suppresses the write-back, which is
+    how a verify pass leaves the committed state alone.
 
-    Both modes keep the same 64/32 address split the state pool already forced
-    on the decode kernel: the MUBUF offset operand is 32 bits, so anything
-    scaling with the pool -- or, worse, with the snapshot buffer, whose slot
-    pitch is ``cache_steps`` times larger -- has to be folded into the 64-bit
-    descriptor base instead. Every base below is built that way, and both
-    factors are widened before they are multiplied, since it is the product that
-    overflows.
+    Buffer offsets are 32 bits, so any term scaling with the state pool or the
+    snapshot buffer belongs in the 64-bit descriptor base, with both factors
+    widened before the multiply.
     """
     assert mode in (MTP_MODE_CHAIN, MTP_MODE_SNAPSHOT), f"unknown MTP mode {mode!r}"
     CHAIN = mode == MTP_MODE_CHAIN
     SNAPSHOT = not CHAIN
     TREE = bool(has_tree)
     NO_STATE_WRITE = bool(disable_state_update)
-    # The snapshot buffer is what the tree reloads parents from, so a tree
-    # without one has nothing to roll back to.
     assert not TREE or SNAPSHOT, "the EAGLE tree is the snapshot mode's"
     assert not TREE or len(inter_strides) == 5, "tree needs a snapshot buffer"
     SAVE_INTER = SNAPSHOT and len(inter_strides) == 5
 
-    # Whether a snapshot read back returns the accumulator that was written.
-    # Only then may the tree skip reloading a parent it still holds; at a
-    # narrower buffer dtype the reload is a rounding, not redundant work.
+    # A snapshot read back returns the accumulator that was written only at f32.
+    # At a narrower dtype the reload is a rounding, so the tree cannot skip it.
     LOSSLESS_SNAPSHOT = TREE and "f32" in inter_dtype
 
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
@@ -528,9 +517,6 @@ def create_vk_gdr_mtp_kernel(
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
     assert WARP_SIZE == 64
 
-    # The tiling arithmetic repeats the decode builder's rather than sharing a
-    # helper with it: that kernel is tuned and shipping, and a shared helper is a
-    # way for a change made for MTP to reach it.
     WARP_TILE_K = WARP_THREADS_K * VALUES_PER_THREAD_K
     WARP_TILE_K_ITERS = head_k_dim // WARP_TILE_K
     assert WARP_TILE_K_ITERS >= 1
@@ -543,16 +529,13 @@ def create_vk_gdr_mtp_kernel(
     assert TILE_V >= 1 and head_v_dim % NUM_BLOCKS_PER_V_DIM == 0
     assert WARP_TILE_V_ITERS >= 1 and TILE_V % WARP_GROUP_TILE_V == 0
 
-    # Registers the resident state alone occupies. It is the tiling's whole
-    # register story: every other live value in the token body is a scalar or a
-    # single K vector.
+    # Registers the resident state occupies. Every other live value in the token
+    # body is a scalar or a single K vector.
     STATE_REGS = WARP_TILE_V_ITERS * WARP_TILE_K_ITERS * VALUES_PER_THREAD_K
 
-    # What one wave may allocate and still leave room for four on a SIMD. gfx9
-    # gives a wave64 SIMD a 512-entry vector file, so four resident waves is
-    # 128 registers each; WARP_SIZE is asserted 64 above, so the wave width
-    # this assumes is not in question. A tiling whose state alone reaches this
-    # has nothing left to spend on scheduling freedom.
+    # A wave64 SIMD has a 512-register vector file, so four resident waves is
+    # 128 each. A tiling whose state alone reaches that leaves nothing for
+    # scheduling freedom.
     VGPR_PER_WAVE_AT_4 = 512 // 4
 
     WARP_THREADS_K_SHFL_OFFSETS = []
@@ -565,12 +548,9 @@ def create_vk_gdr_mtp_kernel(
     STATE_BYTES = get_dtype_bytes(state_dtype)
     INTER_BYTES = get_dtype_bytes(inter_dtype) if SAVE_INTER else 0
 
-    # The snapshot borrows the state's lane count -- VALUES_PER_THREAD_K is
-    # picked so the *state* vector is 16 bytes, and the snapshot reuses it with
-    # its own element -- so a snapshot wider than the state overruns what a
-    # buffer op carries. Caught here as well as at the API, because this is the
-    # layer that cannot express the store: without it the combination reaches
-    # the backend as a 32-byte store and dies there as `Cannot select`.
+    # The snapshot reuses the state's lane count, which is picked so the state
+    # vector is 16 bytes. A wider snapshot element overruns what one buffer op
+    # carries, and this is the layer that cannot express the store.
     assert not SAVE_INTER or VALUES_PER_THREAD_K * INTER_BYTES <= 16, (
         f"a {state_dtype} state splits K {VALUES_PER_THREAD_K} ways, so a "
         f"{inter_dtype} snapshot needs a "
@@ -608,13 +588,8 @@ def create_vk_gdr_mtp_kernel(
     ):
         scale = fx.Float32(SCALE_VALUE)
         softplus_beta_ = fx.Float32(softplus_beta)
-        # Reciprocal of a builder constant, taken in Python rather than left as
-        # a divide in the token body. At the default beta of 1.0 this changes
-        # nothing, and measurably so: the backend folds `x / 1.0` away
-        # entirely, which is why making this change by itself moved no
-        # instruction. It is for every other beta. Only an exact power of two
-        # becomes a multiply; any other divisor is the full div_scale / rcp /
-        # div_fmas / div_fixup expansion, eleven instructions once per token.
+        # Reciprocal of a builder constant, so the token body holds a multiply
+        # and not a divide. At the default beta of 1.0 it folds away entirely.
         inv_softplus_beta_ = fx.Float32(1.0 / softplus_beta)
         softplus_threshold_ = fx.Float32(softplus_threshold)
 
@@ -624,7 +599,6 @@ def create_vk_gdr_mtp_kernel(
         state_dtype_ = get_dtype_in_kernel(state_dtype)
         f32_0 = fx.Float32(0.0)
         f32_1 = fx.Float32(1.0)
-        width_i32 = _to_raw(fx.Int32(WARP_SIZE))
         state_vec_t = T.vec(VALUES_PER_THREAD_K, state_dtype_)
         acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
 
@@ -647,38 +621,21 @@ def create_vk_gdr_mtp_kernel(
         # rather than a shape, so a 1-D [B] and a 2-D [B, T] map the same way.
         si_tensor = GTensor(state_indices, dtype=T.i32, shape=(-1,))
 
-        # Read every token's checkpoint slot here rather than at the token that
-        # writes it.
-        #
-        # The chain's slots are `seq_length` independent int32s, but read one
-        # per token they turned into one dependent round trip per token: the
-        # load is issued inside the token's own body and the compare that gates
-        # its checkpoint waits at vmcnt(0), which drains every other load in
-        # flight along with it. That was 20% of stall cycles at batch 1, spread
-        # evenly across the loop, and it is the one part of the token's inputs
-        # the lookahead below does not already cover.
-        #
-        # Reading them together costs `seq_length` registers and lets one wait
-        # cover all of them, inside the prologue that is already waiting on the
-        # rollback lookup. The snapshot contract has a single slot for the whole
-        # sequence, so there is nothing to spread there.
+        # Every token's checkpoint slot, read together in the prologue that is
+        # already waiting on the rollback lookup, so one wait covers all of them
+        # at a cost of `seq_length` registers. The snapshot contract has one
+        # slot per sequence, so there is nothing to spread.
         if const_expr(CHAIN):
             token_slots = [
                 fx.Int32(si_tensor[b_i * si_strides[0] + t * si_strides[1]])
                 for t in range_constexpr(seq_length)
             ]
 
-        def _slot_at(token):
-            if const_expr(CHAIN):
-                return token_slots[token]
-            return fx.Int32(si_tensor[b_i * si_strides[0]])
-
-        # What counts as a dead slot, which the two contracts spell differently.
-        # SGLang pads with a negative sentinel and slot 0 is an ordinary slot;
-        # vLLM reserves slot 0 as its null block (`state_idx <= 0` skips the
-        # sequence, `final_state_idx > 0` gates the checkpoint) and aiter's
-        # Triton passes a negative sentinel through the same entry point. So the
-        # chain has to reject both and the snapshot mode must not reject slot 0.
+        # The two contracts spell a dead slot differently: SGLang pads with a
+        # negative sentinel and slot 0 is ordinary, while vLLM reserves slot 0
+        # as its null block and aiter's Triton passes a negative sentinel
+        # through the same entry point. So the chain rejects both and the
+        # snapshot mode must not reject slot 0.
         MIN_LIVE_SLOT = 1 if CHAIN else 0
 
         # Rollback point. The chain rolls back to the last accepted token's
@@ -738,9 +695,8 @@ def create_vk_gdr_mtp_kernel(
         def _state_at(slot):
             """State-pool view whose descriptor base already carries the slot.
 
-            ``slot * state_strides[0]`` is the term that scales with the pool, so
-            it is the one that cannot sit in the 32-bit buffer offset. Both
-            factors are widened before multiplying.
+            ``slot * state_strides[0]`` scales with the pool, so it cannot sit
+            in the 32-bit buffer offset. Both factors are widened first.
             """
             return GTensor(
                 state,
@@ -755,11 +711,9 @@ def create_vk_gdr_mtp_kernel(
         def _inter_at(slot, step):
             """Snapshot view for one (sequence slot, draft step).
 
-            This is the address that overflows first: a slot here spans
-            ``cache_steps`` states where the pool spans one, so the same pool
-            size crosses 2^31 elements ``cache_steps`` times sooner. Slot and
-            step are folded into the 64-bit base separately, for the same reason
-            the pool's is.
+            A slot here spans ``cache_steps`` states where a pool slot spans
+            one, so it crosses 2^31 elements that much sooner. Slot and step go
+            into the 64-bit base for the same reason the pool's does.
             """
             inter_dtype_ = get_dtype_in_kernel(inter_dtype)
             return GTensor(
@@ -784,51 +738,32 @@ def create_vk_gdr_mtp_kernel(
             return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
 
         def fast_rsqrt(x):
-            """Hardware reciprocal square root.
+            """Hardware reciprocal square root, good to about one ULP.
 
-            `fx.math.rsqrt` lowers to a sqrt followed by a correctly-rounded
-            divide, and with fast math off nothing folds either afterwards: the
-            backend emits the denormal pre-scale and ULP fixup around the sqrt
-            and a div_scale / rcp / fma / div_fmas / div_fixup expansion around
-            the divide. That pair is 33 instructions on gfx950, of which the
-            divide alone is 11, where `v_rsq_f32` is one for the same value to
-            about one ULP -- well inside a body that already takes exp as exp2
-            and log1p under fast math, and far inside a bf16 output.
+            That is well inside a body which already takes exp as exp2 and
+            log1p under fast math, and far inside a bf16 output.
             """
             return rocdl.rsq(T.f32, _to_raw(fx.Float32(x)))
 
         def fast_rcp(x):
-            """Hardware reciprocal, for the same reason as `fast_rsqrt`.
+            """Hardware reciprocal, at the accuracy of `fast_rsqrt`.
 
-            The sigmoid gate's denominator is already an exp2, so the eleven
-            instructions of a correctly rounded divide on top of it buy nothing
-            the input can support.
+            The sigmoid gate's denominator is itself an exp2, so a correctly
+            rounded divide on top of it is finer than the input supports.
             """
             return rocdl.rcp(T.f32, _to_raw(fx.Float32(x)))
 
-        # Issue the inputs that do not depend on the rollback slot ahead of the
-        # dead-slot test rather than inside it.
+        # The inputs that do not depend on the rollback slot are issued ahead of
+        # the dead-slot test, so their latency runs under the lookup's:
+        # `read_slot` is two dependent round trips deep -- `num_accepted[b_i]`
+        # names the token, that token's entry names the slot -- while the decay
+        # scalars and token 0's taps are addressed by `b_i` and `hv_i` alone.
         #
-        # `read_slot` sits two dependent round trips deep -- `num_accepted[b_i]`
-        # names the token, that token's entry names the slot -- and the test
-        # below waits on both. Everything a token reads that is addressed by
-        # `b_i` and `hv_i` alone, meaning the decay scalars and token 0's gate
-        # and value taps, is ready to issue long before that. Written inside the
-        # guard it cannot be: their descriptors and loads only go out once the
-        # test resolves, so they queue behind a wait they have no dependence on.
-        # Hoisting them runs their latency underneath the lookup's.
+        # A dead sequence issues these reads and discards them. They are in
+        # bounds either way, which is why the slot loads above are unguarded.
         #
-        # A dead sequence now issues these reads and discards them. They are in
-        # bounds either way -- `b_i` is a real batch row whatever its slot says,
-        # which is already why the slot loads above are unguarded -- and CG-pad
-        # rows are the rare case, so the wasted bytes cost less than the
-        # serialisation they remove.
-        #
-        # Chain contracts only. The tree emits the body once per snapshot arm,
-        # so hoisted values are live across both copies rather than one; that
-        # costs four VGPRs and measured 2% slower over the tree's shapes, 8% at
-        # batch 1, where the chain gains 1.3%. Read against the arm the change
-        # does not touch, in the same interleaved rounds.
+        # Chain contracts only: the tree emits the body once per snapshot arm,
+        # so a hoisted value is live across both copies.
         HOIST_ENTRY = not TREE
 
         def _taps(sq):
@@ -850,19 +785,15 @@ def create_vk_gdr_mtp_kernel(
             entry_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
             entry_taps = _taps(0)
 
-        # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
-        # closure so the runtime `if` sees an opaque call (no GTensor "state"
-        # to thread through an scf.if yield) -- lowers to scf.if, no raw region.
+        # Skip pad slots (a negative sentinel). The guarded body is a closure so
+        # the runtime `if` sees an opaque call rather than a GTensor to thread
+        # through an scf.if yield.
         #
-        # ``reload_parents`` and ``snapshot`` are traced, not runtime, flags.
-        # They have to be: the parent reload *produces* the running state, and a
-        # value defined inside an scf.if does not dominate its use after it, so
-        # the reload cannot sit under a runtime test. What makes hoisting it
-        # sound is that ``cache_idx`` is fixed for the whole kernel -- one
-        # sequence either has a snapshot slot or it does not -- so the test
-        # belongs at the entry, once, rather than at every token. Emitting the
-        # body twice buys back the per-token snapshot guard as well, since each
-        # copy knows statically whether the slot is live.
+        # ``reload_parents`` and ``snapshot`` are traced flags, not runtime
+        # ones: the parent reload produces the running state, and a value
+        # defined inside an scf.if does not dominate its use after it.
+        # ``cache_idx`` is fixed for the whole kernel, so the test sits at the
+        # entry and neither traced body carries a per-token snapshot guard.
         def _do_mtp(reload_parents=False, snapshot="no"):
             if const_expr(not HOIST_ENTRY):
                 if const_expr("f32" in A_log_dtype):
@@ -892,53 +823,27 @@ def create_vk_gdr_mtp_kernel(
                             vi * WARP_TILE_K_ITERS + ki
                         ].extf(acc_vec_t)
 
-            # Read those a token ahead of where they are used.
+            # Each token issues the next token's reads before its own work. A
+            # token ends by storing its state, and nothing tells the compiler
+            # that store cannot land on the gate or value inputs, so a read
+            # placed where it is used cannot be hoisted over it. Taking the
+            # value reads as a group lets one wait cover the whole v loop.
             #
-            # A token ends by storing its state, and nothing tells the compiler
-            # that the store cannot land on the gate or value inputs, so a read
-            # placed where it is used may not be hoisted over the store in front
-            # of it. Every token then opens with a round trip that has only its
-            # own gating arithmetic to hide it. Issuing the next token's reads
-            # before this one's stores puts a whole token of work in front of
-            # that round trip instead, and taking a token's value reads as a
-            # group lets one wait cover the whole v loop rather than one wait per
-            # iteration.
-            #
-            # Depth one, not the whole window: the taps stay unwidened, one
-            # register each, so depth d costs `d * (2 + WARP_TILE_V_ITERS)`
-            # registers, and hoisting all four tokens measured slower
-            # everywhere. A token of work is already enough to cover the round
-            # trip, so further depth buys nothing and the registers it sits in
-            # cost occupancy.
-            #
-            # Token 0's pair is the one hoisted above the dead-slot test where
-            # that pays; the rest are issued here, a token ahead, as before.
+            # Depth stays at one: depth d costs
+            # `d * (2 + WARP_TILE_V_ITERS)` registers, and one token of work
+            # already covers the round trip.
             taps = entry_taps if const_expr(HOIST_ENTRY) else _taps(0)
 
             for sq_i in range_constexpr(seq_length):
                 # EAGLE tree: restart from the parent token's snapshot. Token 0
                 # has no parent and keeps the rollback state loaded above.
                 #
-                # Token 1 is the one case where the parent is known without
-                # reading it: token 0 is the only token before it, so its parent
-                # is token 0, which is also the token just finished -- the state
-                # is still in registers. Reloading it re-reads a full state that
-                # was written moments earlier, and parent reloads are what make
-                # this contract move 2.10 states per (batch, head) against the
-                # chain's 0.54.
-                #
-                # Skipping is only sound where the snapshot round trip returns
-                # the accumulator, hence LOSSLESS_SNAPSHOT: at a narrower buffer
-                # dtype the re-read is a rounding upstream also takes, and
-                # dropping it would change results.
-                #
-                # Only token 1. Later tokens can have any earlier parent, so the
-                # same saving there needs a runtime test, and that test has to
-                # carry the whole state out through an scf.if yield. Measured,
-                # that costs more at the small shapes than the reads it saves,
-                # and on an EAGLE tree it almost never fires -- a token whose
-                # parent is its immediate predecessor is the chain case the tree
-                # exists to generalise away from.
+                # Token 1's parent needs no read: token 0 is the only token
+                # before it and that state is still in registers, so the
+                # snapshot round trip is skipped where it returns the
+                # accumulator exactly (LOSSLESS_SNAPSHOT). Any later token can
+                # have any earlier parent, which would take a runtime test
+                # carrying the whole state out through an scf.if yield.
                 held = LOSSLESS_SNAPSHOT and sq_i == 1
                 if const_expr(reload_parents and sq_i != 0 and not held):
                     parent_step = fx.Int32(
@@ -971,12 +876,10 @@ def create_vk_gdr_mtp_kernel(
                 beta_x = softplus_beta_ * x
 
                 # softplus with the large-x identity: for beta_x > threshold,
-                # softplus(x) == x. select computes both arms (the overflow arm
-                # is discarded) -> bit-identical to the old branch.
+                # softplus(x) == x. Both arms are computed and the overflowing
+                # one discarded.
                 softplus_big = inv_softplus_beta_ * fast_log1p(fast_exp(beta_x))
-                softplus_x = (
-                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
-                ).select(softplus_big, x)
+                softplus_x = (beta_x <= softplus_threshold_).select(softplus_big, x)
 
                 r_g_value = -fast_exp(r_A_log) * softplus_x
                 r_beta = fast_rcp(f32_1 + fast_exp(-r_b))
@@ -989,33 +892,15 @@ def create_vk_gdr_mtp_kernel(
                 sq_vecs = [0] * WARP_TILE_K_ITERS
                 sk_vecs = [0] * WARP_TILE_K_ITERS
 
-                scale_vec = fx.Vector.filled(
-                    VALUES_PER_THREAD_K, fx.Float32(scale), fx.Float32
-                )
+                scale_vec = fx.Vector.filled(VALUES_PER_THREAD_K, scale, fx.Float32)
 
                 if const_expr(STATE_REGS >= VGPR_PER_WAVE_AT_4):
-                    # Where the state already fills the register file, keep the
-                    # gate arithmetic and the L2-norm reduction from
-                    # interleaving: eliminating the divide expansions turned
-                    # both into short clusters the scheduler will happily
-                    # overlap, and the four registers that costs are four this
-                    # tiling does not have. For the one tiling that reaches this
-                    # it is the difference between 3 and 4 resident waves, and
-                    # without it the tuner cannot pick that tiling at all: two
-                    # tuned tree rows now do.
-                    #
-                    # The mask names every memory class, exempting it, so the
-                    # load pipeline that actually limits this kernel keeps its
-                    # freedom; what is held is the arithmetic, meaning VALU,
-                    # SALU and the transcendentals the gate is now built from.
-                    # A full barrier in the same place is worse than none, at
-                    # 140 registers: it makes values live across itself rather
-                    # than stopping them being computed early. Applied
-                    # unconditionally this one costs 0.8% over the sweep, which
-                    # is why the tiling asks for it rather than it always being
-                    # on. Over every tiling the predicate admits it helps or is
-                    # neutral on all but (2,1,4), which is 12% off the pace for
-                    # unrelated reasons and is never tuned to.
+                    # Only where the state already fills the register file: the
+                    # gate arithmetic and the L2-norm reduction are kept from
+                    # interleaving, whose register cost decides whether a
+                    # fourth wave stays resident. The mask exempts every memory
+                    # class, so the load pipeline that limits this kernel keeps
+                    # its freedom and only the arithmetic is held.
                     rocdl.sched_barrier(
                         "all_vmem|vmem_read|vmem_write|all_ds|ds_read|ds_write"
                     )
@@ -1060,18 +945,9 @@ def create_vk_gdr_mtp_kernel(
                         sum_k_partial = sum_k_partial + sum_k_partial.shuffle_xor(
                             offset, WARP_SIZE
                         )
-                    local_sum_q = mlir_gpu.ShuffleOp(
-                        _to_raw(sum_q_partial),
-                        _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
-                        width_i32,
-                        mode="idx",
-                    ).shuffleResult
-                    local_sum_k = mlir_gpu.ShuffleOp(
-                        _to_raw(sum_k_partial),
-                        _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
-                        width_i32,
-                        mode="idx",
-                    ).shuffleResult
+                    lane0 = w_tid // WARP_THREADS_K * WARP_THREADS_K
+                    local_sum_q = fx.shuffle_idx(sum_q_partial, lane0, WARP_SIZE)
+                    local_sum_k = fx.shuffle_idx(sum_k_partial, lane0, WARP_SIZE)
                     inv_norm_q = fast_rsqrt(local_sum_q + 1e-6)
                     inv_norm_k = fast_rsqrt(local_sum_k + 1e-6)
                     inv_norm_q_vec = fx.Vector.filled(
@@ -1125,12 +1001,9 @@ def create_vk_gdr_mtp_kernel(
                         )
 
                     v_new = (r_v - sum_hk) * r_beta
-                    v_new = mlir_gpu.ShuffleOp(
-                        _to_raw(v_new),
-                        _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
-                        width_i32,
-                        mode="idx",
-                    ).shuffleResult
+                    v_new = fx.shuffle_idx(
+                        v_new, w_tid // WARP_THREADS_K * WARP_THREADS_K, WARP_SIZE
+                    )
                     sum_hq = sum_hq_old + v_new * dot_kq
                     v_new_bcast = fx.Vector.filled(
                         VALUES_PER_THREAD_K, fx.Float32(v_new), fx.Float32
@@ -1154,11 +1027,10 @@ def create_vk_gdr_mtp_kernel(
                     if warp_k_vec_start == 0:
                         _write_q()
 
-                # Per-token record. This is the whole difference between verify
-                # and running the draft straight through: without it there is
-                # nothing for a later rejection to roll back to.
+                # Per-token record: without it a later rejection has nothing to
+                # roll back to.
                 if const_expr(CHAIN):
-                    write_slot = _slot_at(sq_i)
+                    write_slot = token_slots[sq_i]
                     write_view = _state_at(write_slot)
 
                     def _checkpoint(_view=write_view):
@@ -1204,9 +1076,9 @@ def create_vk_gdr_mtp_kernel(
                         if cache_idx >= 0:
                             _snapshot()
 
-            # The chain has already written the last token's state to its own
-            # slot, so only the snapshot mode has a final store left to make --
-            # and a verify pass asks for it to be suppressed.
+            # The chain's last token already checkpointed into its own slot, so
+            # only the snapshot mode has a final store left, and a verify pass
+            # asks for it to be suppressed.
             if const_expr(SNAPSHOT and not NO_STATE_WRITE):
                 write_view = _state_at(read_slot)
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
@@ -1225,10 +1097,9 @@ def create_vk_gdr_mtp_kernel(
                         )
 
         # One entry test per traced body, flat rather than nested, so no scf.if
-        # ever has to carry a value out of itself. In tree mode the two arms are
-        # complementary: a sequence with a snapshot slot reloads its parents, a
-        # sequence without one has nothing to reload and no snapshot to write,
-        # which is the same thing the chain does.
+        # has to carry a value out of itself. The tree's two arms are
+        # complementary: with a snapshot slot a sequence reloads its parents,
+        # without one it has nothing to reload and nothing to record.
         if const_expr(TREE):
             if (read_slot >= MIN_LIVE_SLOT) & (cache_idx >= 0):
                 _do_mtp(reload_parents=True, snapshot="always")

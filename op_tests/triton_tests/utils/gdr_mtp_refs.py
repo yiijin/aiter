@@ -11,15 +11,12 @@
 # https://github.com/sgl-project/sglang
 # ==============================================================================
 # ruff: noqa
-# ^ Every kernel below is a verbatim copy of upstream (see the docstring), and
-# every edit is a place a copy can silently drift from the kernel it is supposed
-# to be measuring against. The findings are upstream's own.
+# ^ Every kernel below is a verbatim copy of upstream (see the docstring), so an
+# edit here is a place the copy can silently drift from what it measures.
 """vLLM's and SGLang's gated-delta-rule MTP kernels, vendored as references.
 
 These are **copies, not transcriptions**: they are the oracles for correctness
-*and* the baselines for performance, which a torch reference cannot be -- it can
-say whether an answer is right, not whether the port is faster than what it
-replaces.
+*and* the baselines for performance, which a torch reference cannot be.
 
 vLLM, at ``63a9a5010``:
 
@@ -43,17 +40,15 @@ write-back entirely. Neither can stand in for the other.
 
 vLLM also splits gating from recurrence across two launches, so reaching its
 chain semantics from a fused-gating interface takes both of its kernels in
-series. That series is vendored rather than reduced to two lines of torch
-precisely because of the rounding described below.
+series.
 
 **A divergence to keep in view when reading test tolerances.** vLLM's
 ``fused_gdn_gating`` stores ``beta_output`` in ``b.dtype`` -- bf16 in practice
 -- and the recurrence then reloads it, so beta is rounded to bf16 before it
-multiplies anything. vLLM's own fused packed-decode kernel reproduces that
-rounding deliberately (``tl.sigmoid(b_val).to(b.dtype.element_ty)``). SGLang's
-fused kernel and aiter's ``fused_rearrange_sigmoid_gdr`` both keep beta in fp32.
-The two oracles therefore disagree with each other by a beta rounding, and a
-port cannot be bit-exact against both at once.
+multiplies anything. SGLang's fused kernel and aiter's
+``fused_rearrange_sigmoid_gdr`` both keep beta in fp32. The two oracles
+therefore disagree with each other by a beta rounding, and a port cannot be
+bit-exact against both at once.
 
 Vendored rather than imported because the aiter test suite must not depend on
 SGLang or vLLM being installed, and because a live import would silently
@@ -68,10 +63,9 @@ Shims, and nothing else, separate each copy from its upstream:
   names for kernels implementing different contracts, and one file cannot hold
   both. Nothing else about either body changes.
 
-The copies are otherwise unmodified except by this repo's ``black``, which is
-semantics-preserving, so re-syncing stays mechanical: re-extract the line range,
-re-apply the shims above, run ``black``. A diff against an upstream checkout
-treated the same way should show the shims and nothing else.
+The copies are otherwise unmodified except by this repo's ``black``, so a diff
+against an upstream checkout formatted the same way shows the shims and nothing
+else.
 """
 
 from typing import Optional
