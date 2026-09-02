@@ -31,10 +31,9 @@ __all__ = [
 GDR_GLOBAL_CONFIG_MAP = None
 GDR_GPU_ARCH = get_rocm_arch()
 
-# Which kernel a tuned row was measured against. The three MTP contracts tile
-# differently at the same shape -- at batch 32 the chain wants (4, 2, 8), the
-# snapshot (8, 1, 16) and the tree (1, 4, 8), with no overlap -- so the row has
-# to name its contract or the three overwrite each other.
+# Which kernel a tuned row was measured against. The three MTP contracts pick
+# different tilings at the same shape, so a row has to name its contract or
+# they overwrite each other.
 GDR_VARIANT_DECODE = "decode"
 
 
@@ -132,12 +131,11 @@ def get_default_kwargs(
     return d
 
 
-# Raising NUM_BLOCKS_PER_V_DIM past this stopped paying: by then the grid
-# already covers the machine, and the narrower value tile costs more in warps
-# than the extra blocks return.
+# Past this the grid already covers the machine and the narrower value tile
+# costs more in warps than the extra blocks return.
 _MTP_MAX_V_SPLIT = 8
-# Blocks per CU to aim for. Two was not enough -- at 2x the rule stops splitting
-# while batch 2 and 4 still gain from more blocks.
+# Blocks per CU to aim for; small batches need it this high to reach a split
+# that still pays.
 _MTP_BLOCKS_PER_CU = 4
 _MTP_WARPS = 4
 _CU_COUNT = {}
@@ -150,22 +148,32 @@ def _cu_count(device):
     return _CU_COUNT[idx]
 
 
+def _mtp_warps(tile_v, warp_threads_v):
+    """Most warps up to ``_MTP_WARPS`` whose group tiles ``tile_v``, or None.
+
+    The group has to divide the tile exactly, and a head width that is a
+    multiple of 32 without being a power of two has splits where no warp count
+    does; those give None so the caller stops splitting.
+    """
+    for num_warps in range(min(_MTP_WARPS, tile_v // warp_threads_v), 0, -1):
+        if tile_v % (num_warps * warp_threads_v) == 0:
+            return num_warps
+    return None
+
+
 def _mtp_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype, target):
     """Split the value dimension until the grid covers the machine.
 
     ``NUM_BLOCKS_PER_V_DIM`` and ``NUM_WARPS`` are not independent: a warp group
     covers ``NUM_WARPS * (64 // WARP_THREADS_K)`` of a value tile that is
     ``head_v_dim // NUM_BLOCKS_PER_V_DIM`` wide, so their product has to divide
-    the tile. Splitting therefore costs warps, and they are given back here
-    rather than left for the builder to reject.
+    the tile. Splitting therefore costs warps, which this gives back so every
+    config it returns is one the builder accepts.
 
-    ``WARP_THREADS_K`` is the second lever and the reason for the retry.
-    Widening the K group narrows a warp's value footprint, which raises the
-    product the tiling admits and so allows a further split -- at the price of
-    one more stage in the cross-lane reduction. That trade is worth taking only
-    where splitting alone cannot fill the machine: measured, the wider group is
-    the best config at batch 1 and 2 and costs 6-12% from batch 32 up. So the
-    narrow group is tried first and kept unless it leaves the grid short.
+    ``WARP_THREADS_K`` is the second lever. A wider K group narrows a warp's
+    value footprint, admitting a further split at the price of one more stage
+    in the cross-lane reduction, and is taken only where splitting under the
+    narrow group leaves the grid short.
     """
     values_per_thread_k = 4 if state_dtype == torch.float32 else 8
     best = None
@@ -174,7 +182,8 @@ def _mtp_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype, ta
             continue
         warp_threads_v = 64 // warp_threads_k
         limit = head_v_dim // warp_threads_v  # largest num_blocks * num_warps
-        if limit < 1:
+        num_warps = _mtp_warps(head_v_dim, warp_threads_v)
+        if num_warps is None:
             continue
         num_blocks = 1
         while (
@@ -183,10 +192,14 @@ def _mtp_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype, ta
             and head_v_dim % (num_blocks * 2) == 0
             and batch_size * num_v_heads * num_blocks < target
         ):
+            split_warps = _mtp_warps(head_v_dim // (num_blocks * 2), warp_threads_v)
+            if split_warps is None:
+                break
             num_blocks *= 2
+            num_warps = split_warps
         best = {
             "NUM_BLOCKS_PER_V_DIM": num_blocks,
-            "NUM_WARPS": max(1, min(_MTP_WARPS, limit // num_blocks)),
+            "NUM_WARPS": num_warps,
             "WARP_THREADS_K": warp_threads_k,
         }
         if batch_size * num_v_heads * num_blocks >= target:
@@ -215,27 +228,16 @@ def _mtp_kwargs(
 ):
     """Pick a tiling for the MTP kernel, then let the tuned table override it.
 
-    The decode default splits the value dimension not at all, which is right
+    The decode default does not split the value dimension at all, which is right
     for it: decode is called at the batch a serving step accumulates, so
     ``batch * num_v_heads`` already covers the machine. Verify is called at the
-    batch that has draft tokens outstanding, which is small by construction,
-    and the same default then launches ``num_v_heads`` blocks -- 32 on a
-    Qwen3-Next-shaped model -- onto a part with hundreds of CUs.
+    batch that has draft tokens outstanding, which is small by construction, and
+    the same default would then launch ``num_v_heads`` blocks onto a part with
+    hundreds of CUs.
 
-    Measured on gfx950 at that shape, bf16 in / fp32 state, against a full sweep
-    of the 54 valid configs with the kernel timed under graph capture so the
-    launch path cannot mask it: this recovers 1.73x / 1.50x / 1.23x / 1.18x at
-    batch 1 / 2 / 4 / 8 with a 4-token window and 1.66x / 1.47x / 1.17x / 1.04x
-    with a 2-token window, is flat from batch 16 up where the default already
-    fills the grid, and lands a mean 1.02x off the per-shape optimum against the
-    default's 1.22x.
-
-    What it does not close is the last 1.02x, which is concentrated above batch
-    32 and reaches 1.08x at the worst shape. That is left to the table rather
-    than to a sharper rule because the three contracts want different splits at
-    the same shape -- at batch 32, (4, 2, 8), (8, 1, 16) and (1, 4, 8), with no
-    overlap -- so rows are keyed by contract and this stays the fallback for the
-    shapes a sweep has not reached.
+    From batch 16 up the rule goes flat, where the default already fills the
+    grid, and what it leaves above that is the tuned table's to reclaim: the
+    three contracts want different splits at the same shape.
     """
     d = _mtp_tiling(
         batch_size,
@@ -393,10 +395,9 @@ def _unit_strided(t: torch.Tensor) -> bool:
     """Whether FlyDSL can wrap ``t`` as a memref.
 
     It needs one axis it can call the fastest-moving one, and a length-1 tensor
-    sliced out of a wider row has none -- torch still calls that contiguous, so
-    the usual check passes it through to a compile error. The index vectors are
-    the ones this happens to, since a caller reaches for a column of its slot
-    map.
+    sliced out of a wider row has none even though torch calls it contiguous.
+    The index vectors are where that arises, since a caller reaches for a
+    column of its slot map.
     """
     return any(s == 1 for s in t.stride())
 
@@ -494,7 +495,7 @@ def _flydsl_gdr_mtp_sglang_supported(
     """Whether ``flydsl_gdr_mtp_sglang`` can serve this problem.
 
     The tree needs somewhere to read parents from, so a parent map without a
-    snapshot buffer is refused rather than silently degraded to a chain.
+    snapshot buffer is unsupported.
     """
     if initial_state_indices is None or initial_state_indices.dim() != 1:
         return False
@@ -511,11 +512,8 @@ def _flydsl_gdr_mtp_sglang_supported(
             return False
         if intermediate_states_buffer.dtype not in _SUPPORTED_STATE_DTYPES:
             return False
-        # The snapshot is stored with the same lane count as the state, since
-        # that is the tiling the kernel is built around, so its element cannot
-        # be the wider of the two: a bf16 state splits K eight ways, and eight
-        # fp32 snapshot elements are a 32-byte store the buffer ops cannot
-        # express. Refused here rather than left to fail in the backend.
+        # The snapshot reuses the state's lane count, so a wider element asks
+        # for a store the buffer ops cannot express.
         if intermediate_states_buffer.dtype.itemsize > state.dtype.itemsize:
             return False
         if intermediate_states_buffer.shape[1] < query.shape[1]:
@@ -539,7 +537,7 @@ def _flydsl_gdr_mtp_sglang_supported(
 
 
 def _snapshot_store_bytes(state_dtype, inter_dtype) -> int:
-    """Width of one thread's snapshot store, for the error that refuses it."""
+    """Width of one thread's snapshot store."""
     values_per_thread_k = 4 if state_dtype == torch.float32 else 8
     return values_per_thread_k * inter_dtype.itemsize
 
@@ -612,9 +610,9 @@ def _mtp_launch(
         _mtp_variant(mode, has_tree),
     )
 
-    # Unused operands are handed an existing tensor rather than a null pointer:
-    # the const_expr guards mean the kernel never builds a descriptor for them,
-    # but the launch still needs a valid address in the slot.
+    # Unused operands are handed an existing tensor: the const_expr guards mean
+    # the kernel never builds a descriptor for them, but the launch still needs
+    # a valid address in the slot.
     filler = state_indices
     inter_strides = tuple(inter_buffer.stride()) if inter_buffer is not None else ()
     parent_strides = tuple(parent_tokens.stride()) if parent_tokens is not None else ()
@@ -688,9 +686,10 @@ def flydsl_gdr_mtp(
     rejection has a slot per draft position to resume from. ``state`` is both
     the initial and the final store, as it is upstream.
 
-    A negative slot is the skip sentinel, matching aiter's Triton kernel and
-    SGLang's. vLLM's own kernel additionally reads slot 0 as null; callers who
-    mean that must not hand slot 0 out as a live slot here.
+    Slot 0 is vLLM's null block and a negative slot is the sentinel aiter's
+    Triton kernel and SGLang pass instead; a sequence whose rollback slot is
+    either is skipped entirely, so slot 0 must not be handed out as a live
+    slot.
     """
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -700,6 +699,7 @@ def flydsl_gdr_mtp(
     assert ssm_state_indices.dim() == 2, "the chain contract needs [batch, token]"
     assert ssm_state_indices.shape[0] == query.shape[0]
     assert ssm_state_indices.shape[1] >= query.shape[1]
+    assert num_accepted_tokens.shape[0] == query.shape[0]
 
     _mtp_launch(
         mode=MTP_MODE_CHAIN,
@@ -789,9 +789,11 @@ def flydsl_gdr_mtp_sglang(
                 "snapshot at `state.dtype` or narrower."
             )
         assert intermediate_state_indices.dtype == torch.int32
+        assert intermediate_state_indices.shape[0] == query.shape[0]
     if retrieve_parent_token is not None:
         assert retrieve_parent_token.dtype == torch.int32
         assert retrieve_parent_token.dim() == 2
+        assert retrieve_parent_token.shape[0] == query.shape[0]
         assert retrieve_parent_token.shape[1] >= query.shape[1]
 
     _mtp_launch(
