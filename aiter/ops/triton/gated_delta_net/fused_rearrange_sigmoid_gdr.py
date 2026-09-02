@@ -41,16 +41,18 @@ def _uniform_draft_window(cu_seqlens: torch.Tensor | None, total_tokens: int) ->
     """Draft length if every sequence has the same one, else -1.
 
     The FlyDSL kernel bakes the window into the kernel it builds, so it can only
-    take a packed batch that unflattens to ``[N, T, ...]``. A ragged batch is not
-    a slow path for it, it is a different kernel per row, so it stays on Triton.
+    take a packed batch that unflattens to ``[N, T, ...]``. A ragged batch is a
+    different kernel per row, so it stays on Triton.
     """
     if cu_seqlens is None:
         return -1
-    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    # One device-to-host copy; the window has to be known on the host to pick
+    # the kernel, so the comparisons are done here rather than one .item() each.
+    lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu")
     if lens.numel() == 0:
         return -1
-    first = int(lens[0].item())
-    if first <= 0 or int(lens.min().item()) != first or int(lens.max().item()) != first:
+    first = int(lens[0])
+    if first <= 0 or int(lens.min()) != first or int(lens.max()) != first:
         return -1
     if first * lens.numel() != total_tokens:
         return -1
@@ -94,8 +96,8 @@ def _try_flydsl_mtp(
         return None
     if qkv.ndim != 2 or qkv.stride(1) != 1:
         return None
-    # The gating constants are compiled into the kernel, so only the pair the
-    # port was measured against is taken.
+    # The gating constants are compiled into the kernel, so only the default
+    # pair is routed.
     if float(softplus_beta) != 1.0 or float(softplus_threshold) != 20.0:
         return None
     if scale is not None and abs(float(scale) - head_k_dim**-0.5) > 1e-12:
@@ -109,33 +111,33 @@ def _try_flydsl_mtp(
 
     H = key_dim // head_k_dim
     HV = value_dim // head_v_dim
-    sl = qkv.stride(0)
+    stride_qkv_l = qkv.stride(0)
     base = qkv.storage_offset()
 
     # q / k / v are strided views into the packed projection rather than copies;
     # the kernel takes their strides as build parameters.
     q = qkv.as_strided(
         (n_seq, window, H, head_k_dim),
-        (window * sl, sl, head_k_dim, 1),
+        (window * stride_qkv_l, stride_qkv_l, head_k_dim, 1),
         base,
     )
     k = qkv.as_strided(
         (n_seq, window, H, head_k_dim),
-        (window * sl, sl, head_k_dim, 1),
+        (window * stride_qkv_l, stride_qkv_l, head_k_dim, 1),
         base + key_dim,
     )
     v = qkv.as_strided(
         (n_seq, window, HV, head_v_dim),
-        (window * sl, sl, head_v_dim, 1),
+        (window * stride_qkv_l, stride_qkv_l, head_v_dim, 1),
         base + 2 * key_dim,
     )
 
     if a.ndim != 2 or b.ndim != 2 or a.stride(1) != 1 or b.stride(1) != 1:
         return None
-    a_v = a.as_strided(
+    a_view = a.as_strided(
         (n_seq, window, HV), (window * a.stride(0), a.stride(0), 1), a.storage_offset()
     )
-    b_v = b.as_strided(
+    b_view = b.as_strided(
         (n_seq, window, HV), (window * b.stride(0), b.stride(0), 1), b.storage_offset()
     )
 
@@ -148,7 +150,7 @@ def _try_flydsl_mtp(
     nacc = num_accepted_tokens.to(torch.int32)
     if not _flydsl_gdr_mtp_supported(q, k, v, initial_state, idx, nacc):
         return None
-    if a_v.dtype != qkv.dtype or b_v.dtype != qkv.dtype:
+    if a_view.dtype != qkv.dtype or b_view.dtype != qkv.dtype:
         return None
     if dt_bias.dtype != qkv.dtype:
         return None
@@ -164,8 +166,8 @@ def _try_flydsl_mtp(
         query=q,
         key=k,
         value=v,
-        a=a_v,
-        b=b_v,
+        a=a_view,
+        b=b_view,
         dt_bias=dt_bias,
         A_log=A_log,
         state=initial_state,
@@ -174,7 +176,8 @@ def _try_flydsl_mtp(
         num_accepted_tokens=nacc,
         use_qk_l2norm=use_qk_l2norm_in_kernel,
     )
-    return out.view(total_tokens, HV, head_v_dim), initial_state
+    # Same rank as the Triton path below, which returns [1, T, HV, V].
+    return out.view(1, total_tokens, HV, head_v_dim), initial_state
 
 
 def fused_rearrange_sigmoid_gated_delta_rule(
@@ -207,9 +210,8 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         qkv.shape == expected_shape
     ), f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
 
-    # FlyDSL port (opt-in). Only the speculative-verify shape is routed; every
-    # other call, and anything outside the port's scope, falls through to Triton
-    # below unchanged.
+    # FlyDSL port (opt-in). Only the speculative-verify shape is routed;
+    # everything else falls through to Triton below unchanged.
     if _flydsl_gdr_enabled():
         routed = _try_flydsl_mtp(
             A_log=A_log,
