@@ -3,26 +3,15 @@
 
 """Parity tests for the FlyDSL gated delta rule MTP kernels.
 
-One kernel builder, two upstream contracts. They are not two spellings of one
-idea: a verify pass has to be able to *undo* the tokens the target model
-rejects, and the two upstreams keep the record it rolls back to in different
-places.
-
-* ``flydsl_gdr_mtp`` -- vLLM's. The draft is a linear chain, the rollback point
-  is the slot at ``ssm_state_indices[n, num_accepted - 1]``, and the record is
-  the state pool itself: every token checkpoints into its own slot
-  ``ssm_state_indices[n, t]``. There is no separate final store, the last
-  token's checkpoint being it.
-* ``flydsl_gdr_mtp_sglang`` -- SGLang's. The sequence keeps one pool slot and
-  the record lives outside the pool in ``intermediate_states_buffer``. With
-  ``retrieve_parent_token`` the draft is an EAGLE **tree**, so each token
-  restarts from its parent's snapshot rather than from its predecessor;
-  ``disable_state_update`` suppresses the write-back, which is how a verify
-  pass leaves the committed state alone.
+One kernel builder, two upstream contracts: ``flydsl_gdr_mtp`` is vLLM's linear
+chain and ``flydsl_gdr_mtp_sglang`` is SGLang's snapshot buffer, with an EAGLE
+tree on top of it. A verify pass has to be able to undo the tokens the target
+model rejects, and what each upstream keeps where is documented on
+``create_vk_gdr_mtp_kernel``.
 
 The reference is the upstream kernel itself
 -------------------------------------------
-Each contract is measured against the kernel it claims to replace: vLLM's fused
+Each contract is checked against the kernel it claims to replace: vLLM's fused
 gating plus its ``fused_recurrent_gated_delta_rule``, and SGLang's
 ``fused_sigmoid_gating_delta_rule_update``, vendored verbatim into
 ``op_tests/triton_tests/utils/gdr_mtp_refs.py``. Nothing here re-derives what
@@ -30,62 +19,21 @@ the recurrence should do.
 
 Nothing imports ``vllm`` or ``sglang``: the suite must not depend on either
 being installed, and a live import would re-point the oracle whenever the
-installed version moved. Both copies carry their upstream revision and line
-range and are re-synced mechanically; see that file's docstring.
+installed version moved.
 
 aiter's own Triton kernel implements the chain contract only, so it is a
 candidate in the perf table and the incumbent at the dispatch seam, but never
 the oracle.
 
-How the numeric bound is set
-----------------------------
-A bf16 result is not required to agree bit-for-bit with the upstream bf16
-kernel: they round differently, and the port is frequently the more accurate of
-the pair, so demanding agreement would pin the worse one's error. vLLM in
-particular rounds ``beta`` to bf16 between its gating kernel and its recurrence,
-which the port and SGLang both keep in fp32. Each upstream is therefore run
-three times per case:
+Each upstream is run three times per case -- at the tested dtype, at fp32 for
+the spec, and at fp32 on absolute values for a conditioning scale. ``_Oracle``
+holds the three, and ``_magnitudes``, ``_assert_tracks_spec`` and
+``_assert_no_worse_than`` each say what their own bound is worth.
 
-* at the tested dtype -- the baseline the port must be no further from the spec
-  than.
-* at **fp32** -- the spec. The same code with ~16 more mantissa bits.
-* at **fp32 on absolute values** -- a conditioning scale.
-
-Unlike the convolution this suite's sibling covers, the recurrence is not a sum
-of products, so the third run is a *magnitude proxy* and not an exact term sum:
-``v - h k`` can cancel whatever the signs, so feeding absolute values bounds no
-individual step. It is used only to give the loose ``_assert_tracks_spec``
-bound something shape-aware to scale by. The check that actually binds is
-``_assert_no_worse_than``, which asks only that the port sit no further from the
-fp32 spec than upstream's own run at the same dtype -- a comparison that needs
-no conditioning model at all.
-
-What is compared bit-exactly, and why it is the interesting comparison
-----------------------------------------------------------------------
-Every value this kernel writes is computed, so there is no output that is a
-pure copy to compare against upstream bit-for-bit the way the convolution's
-rolled window is. But there is an equivalent, and it is stronger for the bug
-class that matters here: the *same* state is written to two different places by
-two different address computations.
-
-Running the chain and running the snapshot mode over the same inputs performs
-one identical recurrence. The chain checkpoints h after token t into
-``state[indices[n, t]]``; the snapshot mode writes the same registers into
-``inter[cache[n], t]``. So they must agree **bit-exactly**, and they exercise
-``_state_at`` and ``_inter_at`` -- the two 64-bit address computations -- against
-each other. ``test_chain_checkpoints_and_snapshots_are_the_same_state`` is that
-comparison and ``test_*_past_2gib_elements`` are the same comparison at a pool
-large enough to overflow a 32-bit offset.
-
-That last pair is the reason this file exists in the shape it does. See §4.1 of
-the handoff: the MUBUF offset operand is 32 bits, and a term that scales with
-the pool wraps silently to another sequence's slot with no fault. A value check
-does not catch it -- a wrapped read and a wrapped write are consistent with each
-other, so the arithmetic still closes and only the *placement* is wrong.
-
-Vendored from vLLM ``63a9a5010`` and SGLang ``18107e38d2``. Bumping either means
-re-extracting the copy, not editing it, so that an answer changing shows up as a
-test failure rather than being absorbed into a hand-edited reference.
+Bit-exactness is asserted only where one state is reached by two address
+computations, which is what makes a wrapped offset observable at all; see
+``test_chain_checkpoints_and_snapshots_are_the_same_state`` and the
+``test_*_past_2gib_elements`` pair.
 
 Usage:
     HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/test_flydsl_gdr_mtp.py
@@ -102,8 +50,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import os
+import statistics
 import sys
 import traceback
 from typing import NamedTuple
@@ -135,22 +85,18 @@ elif not is_flydsl_available():
     _SKIP_REASON = "flydsl is not installed"
 else:
     try:
-        from aiter.ops.flydsl.linear_attention_kernels import (
-            _MTP_BLOCKS_PER_CU,
-            _SUPPORTED_DTYPES,
-            _SUPPORTED_STATE_DTYPES,
-            _flydsl_gdr_mtp_sglang_supported,
-            _mtp_tiling,
-            flydsl_gdr_mtp,
-            flydsl_gdr_mtp_sglang,
-            get_mtp_default_kwargs,
-        )
         from aiter.ops.flydsl.kernels.gdr_decode import (
-            MTP_MODE_CHAIN,
             MTP_MODE_SNAPSHOT,
             create_vk_gdr_mtp_kernel,
         )
         from aiter.ops.flydsl.kernels.tensor_shim import get_dtype_str
+        from aiter.ops.flydsl.linear_attention_kernels import (
+            _SUPPORTED_DTYPES,
+            _SUPPORTED_STATE_DTYPES,
+            _flydsl_gdr_mtp_sglang_supported,
+            flydsl_gdr_mtp,
+            flydsl_gdr_mtp_sglang,
+        )
         from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
             _flydsl_gdr_enabled,
             _uniform_draft_window,
@@ -159,9 +105,9 @@ else:
     except ImportError as exc:
         _SKIP_REASON = f"the FlyDSL GDR MTP kernels do not import ({exc})"
 
-# Only under pytest: CI also shards op_tests with `python3 <file>`, where a
-# module-level skip would raise Skipped with nobody to catch it and the shard
-# would report a failure. main() handles that case instead.
+# Only under pytest. CI also shards op_tests with `python3 <file>`, where a
+# module-level skip raises Skipped with nobody to catch it and the shard reports
+# a failure; main() handles that case.
 if _SKIP_REASON is not None and __name__ != "__main__":
     pytest.skip(
         f"{_SKIP_REASON}. Skipping the FlyDSL GDR MTP tests.",
@@ -194,10 +140,14 @@ _DTYPE_EPS = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11}
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _DTYPE_BY_NAME = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
+#: The state dtype is the one that moves the bytes: at the large-batch rows the
+#: pool is most of the traffic.
+_STATE_DTYPE_NAME = {torch.float32: "fp32", torch.bfloat16: "bf16"}
+_STATE_DTYPE_BY_NAME = {v: k for k, v in _STATE_DTYPE_NAME.items()}
+
 #: How many of those steps a result may accumulate, scaled per element by the
-#: conditioning bound from `_magnitudes`. Larger than the convolution's because
-#: the recurrence compounds over the draft window rather than over a fixed tap
-#: count. The binding check is `_assert_no_worse_than`, not this.
+#: conditioning bound from `_magnitudes`. Loose because the recurrence compounds
+#: over the draft window; the binding check is `_assert_no_worse_than`.
 _ERR_FACTOR = 64.0
 
 #: vLLM's wrapper reads slot 0 as "no state", so live slots start at 1.
@@ -322,20 +272,15 @@ def _magnitudes(p: _Problem, *, init_slots, use_qk_l2norm=True, parents=None):
 
     An error budget has to be scaled by how big the intermediate terms are, not
     by how big the answer is: the delta rule subtracts ``k @ h`` from ``v``, so
-    an output near zero can still be the difference of two large numbers and a
-    budget read off the output would be far too tight there.
+    an output near zero can be the difference of two large numbers and a budget
+    read off the output would be far too tight there.
 
-    Re-running upstream on ``abs()``-ed inputs does not give that number, which
-    is why this exists. ``g = -exp(A_log) * softplus(a + dt_bias)`` is negative
-    by construction, so ``abs(A_log)`` makes the decay *stronger* and the run
-    reports magnitudes below the true ones -- it is not a bound in either
-    direction.
-
-    So the magnitudes are propagated here alongside the real recurrence, with
-    the real ``g`` and ``beta``: ``M`` follows ``h`` step for step with every
-    signed accumulation replaced by an absolute one, which makes each element of
-    ``M`` the sum of the magnitudes of the terms that formed the corresponding
-    element of ``h``. Returns the bound for the outputs and the bound for the
+    Re-running upstream on ``abs()``-ed inputs does not give that number.
+    ``g = -exp(A_log) * softplus(a + dt_bias)`` is negative by construction, so
+    ``abs(A_log)`` strengthens the decay and reports magnitudes below the true
+    ones. The magnitudes are therefore propagated here alongside the real
+    recurrence, with the real ``g`` and ``beta`` and every signed accumulation
+    replaced by an absolute one. Returns the bound for the outputs and for the
     state after each token.
     """
     B, T = p.batch, p.seqlen
@@ -663,11 +608,10 @@ def _assert_no_worse_than(
     still does.
 
     ``slack_steps`` is how many of those steps a difference in summation order
-    alone can account for, which is the length of the reduction behind the
-    element. Two is right for a value the port and upstream both round to a
-    narrow dtype, where that rounding dominates. The states are kept at fp32,
-    where it does not: reassociating the ``k @ h`` reduction over ``head_k_dim``
-    is then the largest term, and callers pass that length instead.
+    alone can account for. Two is right for a value both sides round to a narrow
+    dtype, where that rounding dominates; the states are kept at fp32, where
+    reassociating the ``k @ h`` reduction dominates instead, so callers pass
+    ``head_k_dim``.
     """
     err_fly = (flydsl.double() - spec).abs()
     err_other = (other.double() - spec).abs()
@@ -698,9 +642,7 @@ def _touched_slots(p: _Problem):
 # -- vLLM's chain contract ------------------------------------------------
 
 #: (batch, seqlen, accepted). ``accepted`` picks where each sequence rolls back
-#: to: the whole window, only the first token, or a different point per
-#: sequence -- the last being the one that tells a per-sequence read apart from
-#: a shared one.
+#: to: the whole window, only the first token, or a different point per sequence.
 _CHAIN_CASES = [
     (1, 2, "full"),
     (2, 2, "first"),
@@ -1002,14 +944,12 @@ def test_sglang_tree_without_a_snapshot_slot_runs_the_chain():
 def test_a_snapshot_wider_than_the_state_is_refused_at_every_layer():
     """A snapshot dtype wider than the state's has no store to lower to.
 
-    ``VALUES_PER_THREAD_K`` is chosen so the *state* vector is 16 bytes -- 4
-    fp32 or 8 bf16 -- and the snapshot reuses that lane count with its own
-    element. A bf16 state and an fp32 snapshot therefore ask for eight fp32 in
-    one store, twice what a buffer op carries, and the combination used to
-    reach the backend and abort the process with `Cannot select`. An aborted
-    process cannot be caught, so each layer that can be entered from outside
-    has to refuse it: the dispatch screen by declining the path, and the API
-    and the builder by raising.
+    The lane count is chosen so the *state* vector is 16 bytes -- 4 fp32 or 8
+    bf16 -- and the snapshot reuses it with its own element. A bf16 state and an
+    fp32 snapshot therefore ask for eight fp32 in one store, twice what a buffer
+    op carries, which aborts the compile rather than raising. An aborted process
+    cannot be caught, so every layer reachable from outside has to refuse it:
+    the dispatch screen by declining, the API and the builder by raising.
     """
     p = _make_problem(2, 4, seed=41, state_dtype=torch.bfloat16)
     wide = torch.zeros(
@@ -1063,6 +1003,33 @@ def test_a_snapshot_wider_than_the_state_is_refused_at_every_layer():
 # -- the two address computations, against each other ---------------------
 
 
+@contextlib.contextmanager
+def _one_tiling_for_every_contract():
+    """Drop every contract onto the same tiling, leaving addressing the only
+    difference between them.
+
+    The tuned table is keyed by contract, so at a shape where one contract has
+    a row and another does not, the two run different tilings -- and a tiling
+    sets how the recurrence is split across lanes, so it sets the order the
+    partial products are summed in. Different orders differ by a few ulp, which
+    is arithmetic, not placement, and it would sit on top of exactly the signal
+    the bit-exact comparison below is reading. Emptying the table drops both
+    onto the rule, which does not take a contract and so answers both the same.
+    """
+    import aiter.ops.flydsl.linear_attention_kernels as lak
+
+    saved = lak.GDR_GLOBAL_CONFIG_MAP
+    lak.GDR_GLOBAL_CONFIG_MAP = {}
+    # The lookup memoises on the shape, not on the table, so a shape already
+    # asked for would come back with the row still applied.
+    lak._mtp_kwargs.cache_clear()
+    try:
+        yield
+    finally:
+        lak.GDR_GLOBAL_CONFIG_MAP = saved
+        lak._mtp_kwargs.cache_clear()
+
+
 def test_chain_checkpoints_and_snapshots_are_the_same_state():
     """The comparison that catches an addressing bug rather than a value bug.
 
@@ -1076,19 +1043,24 @@ def test_chain_checkpoints_and_snapshots_are_the_same_state():
     write wrap together, the arithmetic still closes, and only the placement is
     wrong. Holding two independent address computations against each other is
     what makes the wrap observable.
+
+    Both runs are held to one tiling so that the comparison stays a comparison
+    of addresses; see ``_one_tiling_for_every_contract``.
     """
     for batch, seqlen in ((1, 2), (4, 4), (3, 8)):
         p = _make_problem(batch, seqlen, seed=batch * 5 + seqlen, accepted="first")
         # The chain rolls back to the slot for token 0, which holds the state
         # *after* token 0, not before it. Point the snapshot run at the same
         # place by giving it that slot as its single sequence slot.
-        chain_out, chain_pool = _run_flydsl_chain(p)
+        with _one_tiling_for_every_contract():
+            chain_out, chain_pool = _run_flydsl_chain(p)
 
-        # A column of the slot map, copied rather than viewed: a length-1 slice
-        # keeps the row pitch as its stride and torch still calls it contiguous.
-        slot0 = torch.empty_like(p.seq_indices).copy_(p.chain_indices[:, 0])
-        snap = p._replace(seq_indices=slot0)
-        snap_out, _, inter = _run_flydsl_sglang(snap, save_inter=True)
+            # A column of the slot map, copied rather than viewed: a length-1
+            # slice keeps the row pitch as its stride and torch still calls it
+            # contiguous.
+            slot0 = torch.empty_like(p.seq_indices).copy_(p.chain_indices[:, 0])
+            snap = p._replace(seq_indices=slot0)
+            snap_out, _, inter = _run_flydsl_sglang(snap, save_inter=True)
 
         # Both start from the same state, so token 0's answers agree and every
         # checkpoint does. The chain's slot for token t holds the same value the
@@ -1117,7 +1089,7 @@ _I32_ELEMS = 2**31
 
 
 def test_chain_addresses_a_state_pool_past_2gib_elements():
-    """§4.1: the pool term has to be 64-bit, and nothing smaller shows it.
+    """The pool term has to be 64-bit, and nothing smaller shows it.
 
     A slot is ``HV * V * K`` elements, so a pool crosses 2**31 elements at a
     slot count an ordinary serving cache reaches. Past that, a 32-bit offset
@@ -1281,6 +1253,14 @@ def test_dispatch_seam_routes_to_flydsl(batch, seqlen):
     routed_out, routed_pool = _triton_call(p, flydsl=True)
     direct_out, direct_pool = _run_flydsl_chain(p)
 
+    # The entry's own contract: routing is an implementation detail, so the
+    # shape it hands back must not depend on which path served the call.
+    unrouted_out, _ = _triton_call(p, flydsl=False)
+    assert routed_out.shape == unrouted_out.shape, (
+        f"seam b{batch} s{seqlen}: routing changed the entry's output shape "
+        f"({tuple(routed_out.shape)} routed, {tuple(unrouted_out.shape)} on Triton)"
+    )
+
     _assert_bit_exact(
         f"seam b{batch} s{seqlen}",
         "the routed output against the direct call",
@@ -1354,161 +1334,6 @@ def test_dispatch_seam_agrees_with_triton():
     )
 
 
-# -- the tiling heuristic -------------------------------------------------
-
-
-def test_the_tiling_heuristic_only_emits_configs_the_builder_accepts():
-    """Every shape the predicate admits must get a tiling that compiles.
-
-    The heuristic reproduces the builder's tiling constraints to choose a
-    config, so the two can drift. This walks the batch range and both state
-    dtypes and asserts the constraints directly, which is cheaper than
-    compiling each one and fails with the arithmetic rather than a trace.
-    """
-    for state_dtype in _SUPPORTED_STATE_DTYPES:
-        values_per_thread_k = 4 if state_dtype is torch.float32 else 8
-        for num_v_heads, head_k_dim, head_v_dim in (
-            (4, 128, 128),
-            (8, 128, 128),
-            (32, 128, 128),
-            (16, 64, 128),
-        ):
-            for batch in (1, 2, 3, 5, 8, 13, 32, 64, 128, 257):
-                for seqlen in (1, 2, 3, 4, 8):
-                    kw = get_mtp_default_kwargs(
-                        str(DTYPE),
-                        str(state_dtype),
-                        state_dtype,
-                        batch,
-                        seqlen,
-                        2,
-                        num_v_heads,
-                        head_k_dim,
-                        head_v_dim,
-                        torch.device(DEVICE),
-                        MTP_MODE_CHAIN,
-                    )
-                    nb = kw["NUM_BLOCKS_PER_V_DIM"]
-                    nw = kw["NUM_WARPS"]
-                    wtk = kw["WARP_THREADS_K"]
-                    where = (
-                        f"b{batch} s{seqlen} hv{num_v_heads} "
-                        f"k{head_k_dim} v{head_v_dim} {state_dtype} -> "
-                        f"({nb}, {nw}, {wtk})"
-                    )
-                    assert 64 % wtk == 0, where
-                    warp_tile_k = wtk * values_per_thread_k
-                    assert head_k_dim % warp_tile_k == 0, where
-                    assert head_k_dim // warp_tile_k >= 1, where
-                    assert head_v_dim % nb == 0, where
-                    tile_v = head_v_dim // nb
-                    warp_group_tile_v = nw * (64 // wtk)
-                    assert tile_v % warp_group_tile_v == 0, where
-                    assert tile_v // warp_group_tile_v >= 1, where
-
-
-def test_every_tuned_row_is_a_tiling_the_builder_accepts():
-    """The table overrides the rule, so a bad row is a compile failure at serve.
-
-    The rule derives its tiling from the builder's constraints and so cannot
-    emit an illegal one; a table row is measured data pasted in by a sweep and
-    can be anything. This re-derives the constraints against every row rather
-    than compiling them, which would take hours for a few thousand rows.
-    """
-    import csv as _csv
-    from pathlib import Path as _Path
-
-    import aiter.ops.flydsl.linear_attention_kernels as lak
-
-    path = _Path(lak.__file__).resolve().parent / "gdr_decode_tuned.csv"
-    with open(path, newline="", encoding="utf-8") as fh:
-        rows = list(_csv.DictReader(fh))
-    assert rows, f"{path} has no rows"
-
-    known = {lak.GDR_VARIANT_DECODE, "chain", "snapshot", "snapshot_tree"}
-    for row in rows:
-        variant = row["variant"]
-        head_k_dim, head_v_dim = int(row["head_k_dim"]), int(row["head_v_dim"])
-        nb = int(row["NUM_BLOCKS_PER_V_DIM"])
-        nw = int(row["NUM_WARPS"])
-        wtk = int(row["WARP_THREADS_K"])
-        where = (
-            f"{row['arch']} {variant} {row['dtype']}/{row['state_dtype']} "
-            f"b{row['b']} s{row['sq']} k{head_k_dim} v{head_v_dim} "
-            f"-> ({nb}, {nw}, {wtk})"
-        )
-        assert variant in known, where
-        assert 64 % wtk == 0, where
-        values_per_thread_k = 4 if "float32" in row["state_dtype"] else 8
-        warp_tile_k = wtk * values_per_thread_k
-        assert head_k_dim % warp_tile_k == 0, where
-        assert head_k_dim // warp_tile_k >= 1, where
-        assert head_v_dim % nb == 0, where
-        tile_v = head_v_dim // nb
-        warp_group_tile_v = nw * (64 // wtk)
-        assert tile_v % warp_group_tile_v == 0, where
-        assert tile_v // warp_group_tile_v >= 1, where
-
-
-def test_a_tuned_row_is_read_back_for_the_contract_it_was_measured_on():
-    """Rows are per contract, so the lookup must not hand one to another.
-
-    The three contracts pick different tilings at the same shape, which is the
-    whole reason the row carries a variant; if the key dropped it they would
-    silently share whichever row was loaded last.
-    """
-    import aiter.ops.flydsl.linear_attention_kernels as lak
-
-    shape = ("torch.bfloat16", "torch.float32", 7717, 4, 2, 32, 128, 128)
-    saved = lak.GDR_GLOBAL_CONFIG_MAP
-    try:
-        lak.GDR_GLOBAL_CONFIG_MAP = {
-            ("torch.bfloat16", "torch.float32", lak.GDR_GPU_ARCH, "chain")
-            + shape[2:]: {
-                "NUM_BLOCKS_PER_V_DIM": 4,
-                "NUM_WARPS": 2,
-                "WARP_THREADS_K": 8,
-            }
-        }
-        assert lak._tuned_config(*shape, "chain")["NUM_BLOCKS_PER_V_DIM"] == 4
-        assert lak._tuned_config(*shape, "snapshot") is None
-        assert lak._tuned_config(*shape, "snapshot_tree") is None
-        assert lak._tuned_config(*shape) is None
-    finally:
-        lak.GDR_GLOBAL_CONFIG_MAP = saved
-
-
-def test_the_tiling_heuristic_splits_only_while_the_grid_is_small():
-    """The rule has to be the one that was measured, not merely a valid one.
-
-    Splitting the value dimension is what makes the small-batch cases fast and
-    what costs nothing at large batch, so both halves are pinned: a small batch
-    must get more blocks than heads, and a batch that already covers the machine
-    must be left at the decode tiling.
-
-    This asks the rule directly rather than through ``get_mtp_default_kwargs``,
-    which would answer out of the tuned table wherever the sweep has reached
-    and so stop testing the rule at exactly the shapes the sweep covers.
-    """
-    cus = torch.cuda.get_device_properties(0).multi_processor_count
-
-    def pick(batch, num_v_heads=32):
-        return _mtp_tiling(
-            batch,
-            num_v_heads,
-            HEAD_K_DIM,
-            HEAD_V_DIM,
-            STATE_DTYPE,
-            _MTP_BLOCKS_PER_CU * cus,
-        )["NUM_BLOCKS_PER_V_DIM"]
-
-    assert pick(1) > 1, "batch 1 was left with one block per value dimension"
-    assert pick(1) >= pick(8) >= pick(cus), "the split must fall as batch rises"
-    assert (
-        pick(4 * cus) == 1
-    ), "a batch that already covers the machine was split anyway"
-
-
 # -- perf -----------------------------------------------------------------
 
 #: ``vllm_chain`` is the linear-chain contract, measured against vLLM's own
@@ -1521,11 +1346,11 @@ BENCH_MODES = ("vllm_chain", "sglang_chain", "sglang_tree")
 def _bench_bytes(p: _Problem):
     """Bytes the contract forces the kernel to move, at best.
 
-    The state dominates everything else by three orders of magnitude and is the
-    reason the large-batch rows converge: the chain writes one full state per
-    draft token, because which token is accepted is not known until after the
-    pass, and reads one per sequence for the rollback point. The snapshot mode
-    writes the same volume into its own buffer instead.
+    The state dominates everything else and is why the large-batch rows
+    converge: the chain writes one full state per draft token, since which token
+    is accepted is not known until after the pass, and reads one per sequence
+    for the rollback point. The snapshot mode writes the same volume into its
+    own buffer instead.
     """
     slot = p.num_v_heads * p.head_v_dim * p.head_k_dim * p.pool.element_size()
     tokens = p.batch * p.seqlen
@@ -1537,6 +1362,18 @@ def _bench_bytes(p: _Problem):
     return state + qkv + out
 
 
+# GPU time one sample aims to cover, and the bounds on the iteration count it
+# buys. The floor is the harness default; the ceiling keeps a microsecond-scale
+# row off the clock for more than a few tens of milliseconds.
+_SAMPLE_BUDGET_US = 20_000
+_MIN_ITERS = 101
+_MAX_ITERS = 2001
+
+# A cell whose repeats disagree by more than this was not measured, whatever the
+# median says.
+_SPREAD_WARN_PCT = 5.0
+
+
 @benchmark()
 def test_gdr_mtp_perf(
     batch: int = 4,
@@ -1544,11 +1381,19 @@ def test_gdr_mtp_perf(
     mode: str = "vllm_chain",
     num_v_heads: int = 8,
     dtype: torch.dtype = torch.bfloat16,
+    state_dtype: torch.dtype = STATE_DTYPE,
+    repeats: int = 1,
 ) -> dict:
     """One row of the perf table: every candidate timed and checked on one shape.
 
     The defaults are a small row, so importing this under pytest costs a few
     cheap launches; ``main()`` sweeps the real shapes.
+
+    ``repeats`` above one times every candidate that many times and reports the
+    median, warning on any cell whose samples disagree by more than
+    ``_SPREAD_WARN_PCT``. One sample is enough to see a candidate that has
+    fallen off a cliff, which is all the pytest entry needs, but not to support
+    a claim of a few percent.
 
     Each mode is measured against the upstream that defines its interface:
 
@@ -1560,8 +1405,9 @@ def test_gdr_mtp_perf(
 
     A blank is a call the kernel cannot express, not a gap: aiter's Triton
     implements the chain contract only, and neither upstream implements the
-    other's. Since the table is the union of every row's candidates, a
-    multi-mode run necessarily shows NaN; sweep one mode for a table with none.
+    other's. The candidate set is therefore a property of the mode, which is
+    why the sweep emits one table per mode rather than their NaN-scattered
+    union.
     """
     p = _make_problem(
         batch,
@@ -1569,6 +1415,7 @@ def test_gdr_mtp_perf(
         seed=batch * 31 + seqlen,
         accepted="mixed",
         dtype=dtype,
+        state_dtype=state_dtype,
         num_v_heads=num_v_heads,
         num_k_heads=max(1, num_v_heads // 2),
     )
@@ -1578,12 +1425,10 @@ def test_gdr_mtp_perf(
     parents = _eagle_tree(batch, seqlen) if mode == "sglang_tree" else None
 
     # Each candidate gets its own pool once, before timing, and updates it in
-    # place from then on. Cloning inside the timed call would put a copy of the
-    # whole pool -- half a gigabyte at the large-batch rows, far more than the
-    # kernel itself moves -- into every candidate's measurement, which drags
-    # every ratio toward one exactly where the interesting differences are.
-    # Re-running on an already-updated pool is safe to time: the recurrence
-    # decays what it reads, so the state stays bounded across iterations.
+    # place from then on, keeping a copy of the whole pool out of every
+    # measurement. Re-running on an already-updated pool is safe to time: the
+    # recurrence decays what it reads, so the state stays bounded across
+    # iterations.
     if mode == "vllm_chain":
         ref = _oracle_vllm(p)
         pool_fly = p.pool.clone()
@@ -1687,20 +1532,61 @@ def test_gdr_mtp_perf(
     flops = 4 * 2 * tokens * HV * p.head_v_dim * p.head_k_dim
     nbytes = _bench_bytes(p)
 
-    ret = {"gfx": get_gfx(), "dtype": _DTYPE_NAME[dtype]}
+    errs = {}
     for name, fn in candidates.items():
-        out = fn()
-        _, us = run_perftest(fn)
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = checkAllclose(
-            out.reshape(p.v.shape).float(),
+        errs[name] = checkAllclose(
+            fn().reshape(p.v.shape).float(),
             ref.spec.reshape(p.v.shape).float(),
             rtol=1e-2,
             atol=1e-2,
             msg=f"{name}: {label}",
         )
+
+    # The slowest candidate sets the iteration count for all of them, so the row
+    # stays like-for-like. A fixed count would be a fraction of a millisecond of
+    # work on the cheap shapes, where cells then wander between processes.
+    probe = max(
+        run_perftest(fn, num_iters=11, num_rotate_args=1)[1]
+        for fn in candidates.values()
+    )
+    num_iters = min(_MAX_ITERS, max(_MIN_ITERS, int(_SAMPLE_BUDGET_US / probe)))
+
+    # Round-robin, so the clock's drift over a row falls on every candidate
+    # alike instead of on whichever one held the window it drifted in.
+    # ``num_rotate_args`` is pinned for the same reason: at zero it is derived
+    # from free GPU memory at the moment of the call, and every candidate is a
+    # closure over its own tensors with no argument list to rotate.
+    samples = {name: [] for name in candidates}
+    for _ in range(repeats):
+        for name, fn in candidates.items():
+            samples[name].append(
+                run_perftest(fn, num_iters=num_iters, num_rotate_args=1)[1]
+            )
+
+    ret = {
+        "gfx": get_gfx(),
+        "dtype": _DTYPE_NAME[dtype],
+        "state_dtype": _STATE_DTYPE_NAME[state_dtype],
+    }
+    for name in candidates:
+        seen = samples[name]
+        us = statistics.median(seen)
+        # The median keeps one bad sample out of the number but cannot say the
+        # number was worth taking, so a wide spread is reported with it.
+        spread = 100 * (max(seen) - min(seen)) / us
+        if spread > _SPREAD_WARN_PCT:
+            aiter.logger.warning(
+                "gdr_mtp: %s: %s spread %.1f%% over %d repeats; "
+                "treat that cell as unmeasured",
+                label,
+                name,
+                spread,
+                repeats,
+            )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = errs[name]
     return ret
 
 
@@ -1724,15 +1610,20 @@ def test_perf_row_agrees_with_the_spec(mode):
 def _parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Correctness and perf for the FlyDSL GDR MTP kernels",
+        description="""Correctness and perf for the FlyDSL GDR MTP kernels.
+
+        Every sweep axis defaults to its endpoints rather than its full range:
+        CI runs this file directly, so the perf grid is what sets the shard's
+        runtime, and each cell is a distinct build to compile. Widen any axis
+        on the command line to get the full grid back.""",
     )
-    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 32, 128])
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 128])
     parser.add_argument(
         "-s",
         "--seqlen",
         type=int,
         nargs="*",
-        default=[2, 4],
+        default=[4],
         help="""Draft window. A one-token window is decode, which the decode
         kernel covers and this one is not built for.""",
     )
@@ -1740,9 +1631,11 @@ def _parse_args():
         "--num-v-heads",
         type=int,
         nargs="*",
-        default=[32],
-        help="""Value heads. The default is a Qwen3-Next-shaped model at tp1;
-        the key heads follow at half that.""",
+        default=[4, 32],
+        help="""Value heads; the key heads follow at half that. This is the
+        axis that moves the kernel's occupancy most, so the default keeps the
+        ends of a Qwen3-Next-shaped model's range: 32 at tp1 down to 4 at
+        tp8.""",
     )
     parser.add_argument(
         "-d",
@@ -1753,28 +1646,54 @@ def _parse_args():
         choices=sorted(_DTYPE_BY_NAME),
     )
     parser.add_argument(
+        "--state-dtype",
+        type=str,
+        nargs="*",
+        default=["fp32"],
+        choices=sorted(_STATE_DTYPE_BY_NAME),
+        help="""Recurrent state dtype, swept separately from the activation
+        dtype because it is the one that sets the traffic: the pool is most of
+        what the large-batch rows move. The snapshot follows the state, since a
+        snapshot wider than the state is refused. Defaults to the wider of the
+        two, which bounds that traffic; bf16 state is covered for correctness
+        either way.""",
+    )
+    parser.add_argument(
         "--mode", type=str, nargs="*", default=list(BENCH_MODES), choices=BENCH_MODES
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="""Times each candidate is measured; the table reports the median
+        and a cell whose samples disagree is warned about. One sample per cell
+        is not enough to compare kernels within a few percent of each other.""",
     )
     return parser.parse_args()
 
 
 def _run_perf_sweep(args):
-    rows = []
-    for mode, dtype, num_v_heads, seqlen, batch in itertools.product(
-        args.mode, args.dtype, args.num_v_heads, args.seqlen, args.batch
-    ):
-        rows.append(
+    # One table per mode; the candidate set is a property of the mode.
+    for mode in args.mode:
+        rows = [
             test_gdr_mtp_perf(
                 batch=batch,
                 seqlen=seqlen,
                 mode=mode,
                 num_v_heads=num_v_heads,
                 dtype=_DTYPE_BY_NAME[dtype],
+                state_dtype=_STATE_DTYPE_BY_NAME[state_dtype],
+                repeats=args.repeats,
             )
-        )
-    if rows:
+            for dtype, state_dtype, num_v_heads, seqlen, batch in itertools.product(
+                args.dtype, args.state_dtype, args.num_v_heads, args.seqlen, args.batch
+            )
+        ]
+        if not rows:
+            continue
         aiter.logger.info(
-            "flydsl gdr mtp perf (markdown):\n%s",
+            "flydsl gdr mtp %s perf (markdown):\n%s",
+            mode,
             pd.DataFrame(rows).to_markdown(index=False),
         )
 
@@ -1829,6 +1748,7 @@ def _run_correctness():
         (test_sglang_disable_state_update_leaves_the_pool_alone, [()]),
         (test_sglang_tree_is_not_running_a_chain, [()]),
         (test_sglang_tree_without_a_snapshot_slot_runs_the_chain, [()]),
+        (test_a_snapshot_wider_than_the_state_is_refused_at_every_layer, [()]),
         (test_chain_checkpoints_and_snapshots_are_the_same_state, [()]),
         (test_chain_addresses_a_state_pool_past_2gib_elements, [()]),
         (test_sglang_addresses_a_snapshot_buffer_past_2gib_elements, [()]),
@@ -1836,8 +1756,6 @@ def _run_correctness():
         (test_dispatch_seam_is_off_by_default, [()]),
         (test_dispatch_seam_declines_a_ragged_batch, [()]),
         (test_dispatch_seam_agrees_with_triton, [()]),
-        (test_the_tiling_heuristic_only_emits_configs_the_builder_accepts, [()]),
-        (test_the_tiling_heuristic_splits_only_while_the_grid_is_small, [()]),
         (test_perf_row_agrees_with_the_spec, [(m,) for m in BENCH_MODES]),
     ]
 

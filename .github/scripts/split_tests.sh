@@ -88,6 +88,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_activation.py]=90
     FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=88
     FILE_TIMES[op_tests/test_kvcache.py]=73
+    FILE_TIMES[op_tests/test_flydsl_gdr_mtp.py]=73
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=69
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=69
     FILE_TIMES[op_tests/test_mhc.py]=68
@@ -132,7 +133,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_causal_conv1d_prefill_split_qkv.py]=16
     FILE_TIMES[op_tests/test_moe_ep.py]=16
     FILE_TIMES[op_tests/test_deepgemm.py]=14
-    FILE_TIMES[op_tests/test_flydsl_gdr_mtp.py]=13
     FILE_TIMES[op_tests/test_rmsnorm2dFusedAddQuant.py]=12
     FILE_TIMES[op_tests/test_smoothquant.py]=12
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_group_quant.py]=11
